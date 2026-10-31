@@ -1,0 +1,761 @@
+---
+title: "Lab 2: Evaluation: Metrics and Cross-Validation"
+subtitle: "FW 532 · Python version"
+---
+
+**Goals:**
+
+* To understand what each of a set of common evaluation metrics measures, how the metrics do/don't
+  depend on the prediction threshold, and how to compute them in Python.
+* To implement several cross-validation strategies and explore trade-offs within and among them.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* Python packages: numpy, pandas, matplotlib, scipy, statsmodels, scikit-learn, rasterio (see
+  `requirements.txt`)
+* The course helper module `sdmlab.py` (in the same folder as this notebook)
+
+Remember to run the cells in order, from top to bottom.
+
+```{python}
+# Running on Google Colab? This cell downloads the course files. (Anywhere else it does nothing.)
+import os, sys
+if "google.colab" in sys.modules:
+    if not os.path.exists("/content/fw532"):
+        !git clone -q --depth 1 https://github.com/Hutchinson-Lab/fw532.git /content/fw532
+        %pip install -q rasterio
+    os.chdir("/content/fw532/python")
+```
+
+First, load the packages we need. Besides numpy, pandas, matplotlib, and statsmodels (from Lab 1),
+this lab uses **scikit-learn** (`sklearn`), Python's main machine-learning library, for ROC and
+precision-recall curves and for cross-validation folds. `from ... import ...` lets us use a few
+functions by their short names.
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from scipy.stats import norm
+from sklearn.metrics import (roc_curve, roc_auc_score, auc,
+                             precision_recall_curve, average_precision_score)
+from sklearn.model_selection import StratifiedKFold, GroupKFold
+
+import sdmlab as sdm   # course helpers for rasters and evaluation
+
+env_stack = sdm.load_env()
+```
+
+# SET-UP
+
+In the last lab, you simulated some data and fit at least one model. You looked at parameter
+estimates and the predicted probability surface for the simulated species. Since it was simulated,
+we could directly ask how well the fitted model estimated the parameter values. Of course, in
+reality, you don't already know how the data were generated - this is why you're fitting a model!
+In this lab, we will dig into different ways to measure the quality of your model.
+
+To set up, we'll create a simulated data set again. We'll divide it into two pieces: a "training
+set" for fitting the model, and a "testing set" for evaluating the model. At first, we'll divide it
+arbitrarily, and in the second part of the lab, we'll look at other possible set-ups.
+
+# Simulate Data
+
+This block simulates presence/absence data, for which we'll look at a suite of evaluation metrics.
+
+```{python}
+# define logistic function
+def logistic(x):
+    return np.exp(x) / (1 + np.exp(x))
+
+# scale the climate variables (each layer gets mean 0 and standard deviation 1, as in Lab 1):
+env_stack = env_stack.scale()
+
+# get points
+n_points = 500
+# n_points = 3000
+sim_pts = env_stack.sample_random(n_points, seed=1234)
+
+# set parameters
+intercept = -1.5
+beta1 = -1.5
+beta2 = -1.5
+beta3 = 1.5
+p_occ_raster = logistic(intercept
+                        + beta1 * sdm.scale(env_stack["Precipitation.Seasonality"])
+                        + beta2 * sdm.scale(env_stack["Min.Temperature.of.Coldest.Month"])
+                        + beta3 * sdm.scale(env_stack["Mean.Temperature.of.Wettest.Quarter"]))
+
+# get the values that correspond to the points we selected:
+p_occs = sdm.extract(p_occ_raster, env_stack, sim_pts["x"], sim_pts["y"])
+
+# sample from these probabilities (a *different* seed than above -- see Lab 1):
+rng = np.random.default_rng(5678)
+pres_abs = rng.binomial(n=1, p=p_occs)
+
+# put response and variables together in a DataFrame:
+modeling_df = sim_pts.copy()
+modeling_df.insert(0, "presAbs", pres_abs)
+
+# plot the result
+ax = sdm.plot_map(p_occ_raster, env_stack, title="pOcc")
+present = modeling_df["presAbs"] == 1
+ax.scatter(modeling_df.loc[present, "x"], modeling_df.loc[present, "y"],
+           s=8, color="red", label="detection")
+ax.scatter(modeling_df.loc[~present, "x"], modeling_df.loc[~present, "y"],
+           s=8, color="blue", label="non-detection")
+ax.legend(loc="center left");
+```
+
+(`~` means "not": `~present` is True for the absences.)
+
+Let's make half of these training points and half test points at random. (`sample_random()`
+returns the points in random order, so the first half and the second half are each a random
+sample.) `n_points // 2` is integer division (500 // 2 = 250), and `.iloc[a:b]` selects rows by
+position.
+
+```{python}
+train_data = modeling_df.iloc[:n_points // 2]
+test_data = modeling_df.iloc[n_points // 2:]
+```
+
+# Fit a basic model
+
+Now you can fit a simple model to these data. Let's suppose your model is not perfect - you fail to
+include "Min.Temperature.of.Coldest.Month" and instead include "Precipitation.of.Coldest.Quarter."
+Using this model, you can get predicted probabilities for the test points.
+
+```{python}
+model1_vars = ["Precipitation.Seasonality",
+               "Precipitation.of.Coldest.Quarter",
+               # "Min.Temperature.of.Coldest.Month",
+               "Mean.Temperature.of.Wettest.Quarter"]
+model1 = sm.GLM(train_data["presAbs"],
+                sm.add_constant(train_data[model1_vars]),
+                family=sm.families.Binomial()).fit()
+
+pred_probs = model1.predict(sm.add_constant(test_data[model1_vars]))
+
+pd.DataFrame({"pred": pred_probs.round(2), "truth": test_data["presAbs"]}).head()
+```
+
+Now your model has made some predictions about the test points on the probability scale. Your test
+data includes 0s for absences and 1s for presences. Your task is to choose how to measure the
+agreement (or lack thereof) between your model predictions and the test data.
+
+# PART 1: METRICS
+
+# Thresholded metrics
+
+As you go through this section, you might find this to be a useful reference:
+[Classifier evaluation](https://en.wikipedia.org/wiki/Evaluation_of_binary_classifiers)
+
+One option is to threshold the predictions to turn them into 0s and 1s like the response variable
+in your test data. To do this, you must choose a threshold. For starters, use 0.5, since it is
+halfway between 0 and 1.
+
+```{python}
+thresh = 0.5  # set the threshold
+logical_preds = pred_probs > thresh  # threshold the predictions (True/False)
+binary_preds = logical_preds.astype(int)  # convert to binary (1/0) instead of logical
+pd.DataFrame({"pred": pred_probs.round(2), "truth": test_data["presAbs"],
+              "binary_preds": binary_preds}).head()
+```
+
+Now you can use a confusion matrix to compare the predictions to the observations. A confusion
+matrix has four cells. In R, the caret package computes confusion matrices and a suite of summary
+metrics for them. The course helper `sdm.confusion_summary()` reports the same statistics
+(everything caret prints except McNemar's test). `help()` shows a function's documentation, and
+you can open `sdmlab.py` to see exactly how each number is computed:
+
+```{python}
+help(sdm.confusion_summary)
+```
+
+Here is our first confusion matrix and associated metrics. The function takes the true labels and
+the thresholded predictions; presences (1) are treated as the "positive" class.
+
+```{python}
+cm = sdm.confusion_summary(test_data["presAbs"], binary_preds)
+```
+
+(Note that this arrangement of the cells, with predictions in rows and the truth in columns, is the
+same as caret's and different from the wikipedia page.) Please make sure you understand at least:
+accuracy, no information rate, kappa, sensitivity, specificity, and positive predictive value. Note
+that many of these have more than one name! You can cross-reference with the Wikipedia page.
+
+`cm` is a *dictionary*: a set of named values. `cm["Kappa"]` gets one of them.
+
+Another metric that you may see in ecology but is not automatically computed here is the True
+Skill Statistic (TSS) = Sensitivity + Specificity - 1 (e.g., Allouche et al (2006) below). Let's
+compute sensitivity and specificity by hand from the predictions, to see exactly what they are.
+(`&` means "and"; `np.sum()` of True/False values counts the Trues.)
+
+```{python}
+y_test = test_data["presAbs"]
+sens = np.sum((binary_preds == 1) & (y_test == 1)) / np.sum(y_test == 1)  # TP / all presences
+spec = np.sum((binary_preds == 0) & (y_test == 0)) / np.sum(y_test == 0)  # TN / all absences
+print(sens, cm["Sensitivity"])  # same as the helper's values
+print(spec, cm["Specificity"])
+
+tss = sens + spec - 1
+tss
+```
+
+There are many choices here for measuring success with binary outcomes (i.e., presence/absence
+data)! You are encouraged to think about which of these might be most relevant for different
+modeling scenarios. Which is the best characterization of model success for your project?
+
+All of the above has compared binary predictions to binary true values, where the binary
+predictions were created by thresholding model outputs between 0 and 1. Therefore, the confusion
+matrix and associated metrics will change as the threshold varies. You can prove this to yourself
+by trying a different threshold. There are a variety of ways to choose your threshold. Once again,
+there are choices in how to set the threshold. You could use information from the training data.
+For example, you could take the fitted probabilities on the training data and use the minimum
+probability among all positive training points, so that the model would predict all the positives
+correctly on the training data.
+
+```{python}
+train_fitted = model1.fittedvalues  # fitted probabilities for the training points
+min_train_pres_thresh = train_fitted[train_data["presAbs"] == 1].min()
+min_train_pres_thresh
+```
+
+Or, you could ask to predict 90% of the training positives correctly, etc.
+
+```{python}
+ninety_percent_pres_thresh = np.quantile(train_fitted[train_data["presAbs"] == 1], 0.1)
+ninety_percent_pres_thresh
+```
+
+Or just use the training set prevalence: here, the proportion of 0s in the training data
+(1 - prevalence).
+
+```{python}
+train_prev_thresh = 1 - train_data["presAbs"].mean()
+train_prev_thresh
+```
+
+Another approach would be to choose the threshold based on sensitivity and specificity (e.g. the
+threshold at which they are equal, the threshold that maximizes their sum). This entails searching
+through a set of thresholds.
+
+> **Exercise 1:** Choose one of these alternate thresholds and compute the metrics again. Report
+> what threshold you chose and comment on your results.
+
+# Threshold-independent metrics
+
+Alternatively, you may wish to avoid all this thresholding business. ROC curves plot performance
+across all possible thresholds. The area under these curves summarizes performance into
+threshold-independent measures. scikit-learn's `roc_curve()` computes the curve: for every
+threshold, the false positive rate (FPR = 1 - specificity) and the true positive rate (TPR =
+sensitivity). We plot FPR on the x-axis, running from 0 to 1. (R's pROC package instead puts
+specificity on the x-axis, running from 1 down to 0. It is the same curve.)
+
+The R version of this lab also adds two things to the plot:
+
+* **A smoothed curve.** pROC's `smooth()` assumes the scores of presences and absences are both
+  normally distributed after some transformation (the "binormal" model). Then the ROC curve is a
+  straight line when sensitivity and specificity are put on the normal-quantile (probit) scale. We
+  can do the same: transform with `norm.ppf()`, fit a line with `np.polyfit()`, and transform back
+  with `norm.cdf()`.
+* **Confidence intervals.** pROC's `ci(of = "thresholds")` resamples the test points with
+  replacement (a *bootstrap*) many times and draws error bars for sensitivity and specificity at
+  selected thresholds. Below we do a similar bootstrap and draw a grey band showing, at each FPR,
+  the middle 95% of the bootstrapped sensitivities. The idea is the same, but the band is not
+  identical to pROC's error bars.
+
+```{python}
+# compute the ROC curve (keeping every threshold, like pROC):
+fpr, tpr, roc_thresholds = roc_curve(test_data["presAbs"], pred_probs, drop_intermediate=False)
+
+# smoothed (binormal) version: a straight line on the probit scale
+finite = (fpr > 0) & (fpr < 1) & (tpr > 0) & (tpr < 1)  # norm.ppf(0) and norm.ppf(1) are infinite
+slope, intercept_sm = np.polyfit(norm.ppf(tpr[finite]), norm.ppf(1 - fpr[finite]), deg=1)
+sens_smooth = np.linspace(0.0005, 0.9995, 500)
+spec_smooth = norm.cdf(intercept_sm + slope * norm.ppf(sens_smooth))
+
+# bootstrap band: resample presences and absences separately (like pROC), 2000 times
+y_arr = test_data["presAbs"].to_numpy()
+p_arr = pred_probs.to_numpy()
+pres_idx = np.flatnonzero(y_arr == 1)
+abs_idx = np.flatnonzero(y_arr == 0)
+fpr_grid = np.linspace(0, 1, 101)
+rng = np.random.default_rng(2468)
+boot_tpr = []
+for b in range(2000):
+    idx = np.concatenate([rng.choice(pres_idx, size=len(pres_idx)),
+                          rng.choice(abs_idx, size=len(abs_idx))])
+    fpr_b, tpr_b, _ = roc_curve(y_arr[idx], p_arr[idx])
+    boot_tpr.append(np.interp(fpr_grid, fpr_b, tpr_b))  # sensitivity at each FPR on the grid
+lower, upper = np.percentile(boot_tpr, [2.5, 97.5], axis=0)
+
+fig, ax = plt.subplots(figsize=(5.5, 5))
+ax.fill_between(fpr_grid, lower, upper, color="grey", alpha=0.3, label="95% bootstrap band")
+ax.plot(fpr, tpr, color="black", label="ROC curve")
+ax.plot(1 - spec_smooth, sens_smooth, color="blue", label="smoothed (binormal)")
+ax.plot([0, 1], [0, 1], color="lightgrey", lw=1)  # a model with no skill (AUC = 0.5)
+ax.set_xlabel("False positive rate (1 - specificity)")
+ax.set_ylabel("True positive rate (sensitivity)")
+ax.set_aspect("equal")
+ax.legend(loc="lower right");
+```
+
+The area under the curve (AUC) and a confidence interval for it. `sdm.auc_ci()` uses DeLong's
+method, the default of pROC's `ci()`, and returns three numbers: the lower limit, the AUC, and the
+upper limit.
+
+```{python}
+roc_auc_score(test_data["presAbs"], pred_probs)  # get the area under the curve
+```
+
+```{python}
+sdm.auc_ci(test_data["presAbs"], pred_probs)  # get a confidence interval for the AUC
+```
+
+pROC's `coords(x = "best")` reports the "best" point on the curve: by default, the threshold that
+maximizes sensitivity + specificity (Youden's J, which is the TSS). `np.argmax()` finds the
+position of the largest value. (pROC reports thresholds halfway between adjacent predicted values,
+while scikit-learn reports the predicted values themselves, so the threshold numbers differ
+slightly. Sensitivity and specificity are the same.)
+
+```{python}
+best = np.argmax(tpr - fpr)  # TPR - FPR = sensitivity + specificity - 1
+print(f"threshold   = {roc_thresholds[best]:.4f}")
+print(f"specificity = {1 - fpr[best]:.4f}")
+print(f"sensitivity = {tpr[best]:.4f}")
+```
+
+Partial ROC curves were mentioned by Lobo et al (2008) as an alternative to AUC. pROC calculates
+these through its `auc()` function. scikit-learn has no direct equivalent for a range like this,
+but we can compute it ourselves: the area under the ROC curve for specificity between 0.3 and 0.7,
+i.e., FPR between 0.3 and 0.7. We read the curve's sensitivity off at many closely spaced FPR
+values (`np.interp()`) and add up the area with the trapezoid rule (`auc()`). Like pROC's default,
+this is the raw (un-standardized) partial area, so the largest possible value is 0.4, the width of
+the range.
+
+```{python}
+# AUC clipped to specificity between 0.3 and 0.7
+fpr_range = np.linspace(0.3, 0.7, 2001)
+partial_auc = auc(fpr_range, np.interp(fpr_range, fpr, tpr))
+partial_auc
+```
+
+Sensitivity and specificity are not the only metrics that trade-off as the threshold changes. We
+can also look at precision and recall, with precision-recall curves. Like R's PRROC plot, we color
+the curve by threshold. As a one-number summary, scikit-learn reports the *average precision*,
+which is close to, but not exactly the same as, PRROC's area under the PR curve (they connect the
+points of the curve differently).
+
+```{python}
+precision, recall, pr_thresholds = precision_recall_curve(test_data["presAbs"], pred_probs)
+ap = average_precision_score(test_data["presAbs"], pred_probs)
+
+fig, ax = plt.subplots(figsize=(6.5, 5))
+ax.plot(recall, precision, color="lightgrey", zorder=1)
+points = ax.scatter(recall[:-1], precision[:-1], c=pr_thresholds, s=10, zorder=2)
+fig.colorbar(points, ax=ax, label="threshold")
+ax.set_xlabel("Recall (sensitivity)")
+ax.set_ylabel("Precision (positive predictive value)")
+ax.set_xlim(0, 1)
+ax.set_ylim(0, 1.02)
+ax.set_title(f"PR curve; average precision = {ap:.3f}");
+```
+
+Thought experiment: Suppose that your study extent is much larger than necessary - imagine a
+species endemic to Oregon but with surveys across North America. We can approximate this by adding
+more negatives to the dataset. Suppose these are 'easy' negatives, so the model predicts a very low
+probability of occurrence at all of them - say, 0.0001.
+
+The new data are:
+
+```{python}
+n_new_points = 1000
+new_obs = np.concatenate([test_data["presAbs"], np.zeros(n_new_points)])
+new_preds = np.concatenate([pred_probs, np.full(n_new_points, 0.0001)])
+```
+
+> **Exercise 2:** Plot the original ROC and PR curves, and add new curves to the plots for the data
+> augmented with easily-predicted negatives. What do you notice?
+
+# PART 2: CROSS-VALIDATION
+
+# Models To Fit
+
+We'll fit many logistic regressions below, so let's write two small functions: one to fit a model
+with a given list of variables, and one to predict probabilities from it. We'll also collect each
+set of results in a *dictionary* (`roc_results`), keyed by a label, so one function can redraw all
+the ROC curves so far. `for label, (y, p) in roc_results.items():` loops over the dictionary's
+labels and values.
+
+```{python}
+def fit_glm(variables, data):
+    """Fit a logistic regression (binomial GLM) of presAbs on the given variables."""
+    return sm.GLM(data["presAbs"], sm.add_constant(data[variables]),
+                  family=sm.families.Binomial()).fit()
+
+
+def predict_glm(model, variables, data):
+    """Predicted probabilities of presence for the rows of `data`."""
+    return model.predict(sm.add_constant(data[variables]))
+
+
+roc_results = {}  # label -> (true labels, predictions)
+roc_colors = {"true": "black", "resub": "red", "random": "orange", "long": "green", "grid": "blue"}
+
+
+def plot_rocs(results):
+    """Draw the ROC curve for every entry of `results` on one plot."""
+    fig, ax = plt.subplots(figsize=(5.5, 5))
+    ax.plot([0, 1], [0, 1], color="lightgrey", lw=1)
+    for label, (y, p) in results.items():
+        fpr, tpr, _ = roc_curve(y, p)
+        ax.plot(fpr, tpr, color=roc_colors[label], lw=2, label=label)
+    ax.set_xlabel("False positive rate (1 - specificity)")
+    ax.set_ylabel("True positive rate (sensitivity)")
+    ax.set_aspect("equal")
+    ax.legend(loc="lower right")
+
+
+def print_auc(y, p):
+    """Print the AUC and its DeLong 95% confidence interval."""
+    lower, auc_value, upper = sdm.auc_ci(y, p)
+    print(f"AUC = {auc_value:.4f}    95% CI: {lower:.4f} - {upper:.4f} (DeLong)")
+```
+
+As a benchmark, let's look at the true model that generated the data, fit to all the data and
+evaluated on all the data (resubstitution). This is basically as well as we can hope to do, and
+note that it is not actually perfect, due to the inherent stochasticity/noise.
+
+```{python}
+# fit the true model on all the data:
+true_vars = ["Precipitation.Seasonality",
+             "Min.Temperature.of.Coldest.Month",
+             "Mean.Temperature.of.Wettest.Quarter"]
+true_model = fit_glm(true_vars, modeling_df)
+# evaluate with resubstitution:
+preds_true = predict_glm(true_model, true_vars, modeling_df)
+roc_results["true"] = (modeling_df["presAbs"], preds_true)
+print_auc(modeling_df["presAbs"], preds_true)
+```
+
+Since in the real world we always have some degree of model misspecification, let's use a slightly
+wrong model for the rest of our exploration. Suppose we fail to include Precipitation.Seasonality
+(variable 15) in the model, and include Precipitation.of.Driest.Month (variable 14) instead. Let's
+see how that model does, again using resubstitution. The gap between these is the price we pay for
+model misspecification in this case.
+
+```{python}
+# suppose we do NOT specify the model correctly:
+model_vars = ["Min.Temperature.of.Coldest.Month",
+              "Mean.Temperature.of.Wettest.Quarter",
+              "Precipitation.of.Driest.Month"]
+
+# resubstitution:
+mod_resub = fit_glm(model_vars, modeling_df)
+preds_resub = predict_glm(mod_resub, model_vars, modeling_df)
+roc_results["resub"] = (modeling_df["presAbs"], preds_resub)
+print_auc(modeling_df["presAbs"], preds_resub)
+
+plot_rocs(roc_results)
+```
+
+# Train/Test Splits
+
+Now, instead of resubstitution, let's use some different splitting methods to divide the data into
+a training set and a test set. A small function draws each split on a map.
+
+```{python}
+def plot_split(train, test):
+    """Map the training (purple) and test (gray) points over the first environmental layer."""
+    ax = sdm.plot_map(env_stack["Annual.Mean.Temperature"], env_stack,
+                      title="Annual.Mean.Temperature")
+    ax.scatter(train["x"], train["y"], s=8, color="purple", label="training")
+    ax.scatter(test["x"], test["y"], s=8, color="gray", label="test")
+    ax.legend(loc="lower left")
+```
+
+First, let's divide the points randomly in half. `rng.choice()` picks row positions at random
+(without replacement), and `.drop()` removes those rows to leave the test set.
+
+```{python}
+rng = np.random.default_rng(12345)
+samp = rng.choice(n_points, size=round(0.5 * n_points), replace=False)
+traindata = modeling_df.iloc[samp]
+testdata = modeling_df.drop(modeling_df.index[samp])
+# visualize the split: purple training set and gray test set
+plot_split(traindata, testdata)
+```
+
+Fit the model to these training data, predict on the test data, and evaluate with ROC.
+
+```{python}
+mod_rand = fit_glm(model_vars, traindata)
+preds_rand = predict_glm(mod_rand, model_vars, testdata)
+roc_results["random"] = (testdata["presAbs"], preds_rand)
+print_auc(testdata["presAbs"], preds_rand)
+
+plot_rocs(roc_results)
+```
+
+Next, let's split the data in half longitudinally, based on the median longitude among the
+observed points.
+
+```{python}
+mid_long = modeling_df["x"].median()
+train_idxs = modeling_df["x"] >= mid_long
+traindata = modeling_df[train_idxs]
+test_idxs = modeling_df["x"] < mid_long
+testdata = modeling_df[test_idxs]
+# visualize the split: purple training set and gray test set
+plot_split(traindata, testdata)
+```
+
+Repeat the model fitting and evaluation procedures on this split:
+
+```{python}
+mod_half = fit_glm(model_vars, traindata)
+preds_half = predict_glm(mod_half, model_vars, testdata)
+roc_results["long"] = (testdata["presAbs"], preds_half)
+print_auc(testdata["presAbs"], preds_half)
+
+plot_rocs(roc_results)
+```
+
+Splitting longitudinally might produce two dissimilar datasets (e.g., the elevation distribution
+across the two may be different). A variety of grid-based partitionings might result in more
+similar samples from the environmental space. Here, we can try just a 2x2 grid, with the opposing
+corners put into the same subset. (`|` means "or".)
+
+```{python}
+mid_lat = modeling_df["y"].median()
+
+train_idxs = (((modeling_df["x"] >= mid_long) & (modeling_df["y"] >= mid_lat))
+              | ((modeling_df["x"] < mid_long) & (modeling_df["y"] < mid_lat)))
+traindata = modeling_df[train_idxs]
+test_idxs = (((modeling_df["x"] < mid_long) & (modeling_df["y"] >= mid_lat))
+             | ((modeling_df["x"] >= mid_long) & (modeling_df["y"] < mid_lat)))
+testdata = modeling_df[test_idxs]
+
+# assign to training and test:
+plot_split(traindata, testdata)
+```
+
+Repeat the modeling fitting and evaluation.
+
+```{python}
+mod_grid = fit_glm(model_vars, traindata)
+preds_grid = predict_glm(mod_grid, model_vars, testdata)
+roc_results["grid"] = (testdata["presAbs"], preds_grid)
+print_auc(testdata["presAbs"], preds_grid)
+
+plot_rocs(roc_results)
+```
+
+> **Question 1:** Reflect on this set of simulations. What surprises you? What factors explain the
+> results? Consider: prevalence (and its breakdown in the training/test sets), autocorrelation in
+> the predictor left out of the model, etc. What changes to the data generation and testing process
+> above do you think would have INCREASED the differences among the testing methods? What changes
+> would have DECREASED the differences? [Note: I consider these questions to be nontrivial, so
+> don't be intimidated if you don't have a complete explanation for everything! Please just give
+> this some careful thought and share what you come up with.]
+
+# K-fold cross-validation
+
+The process above splits the data into one training set and one test set. An alternative is to
+split the data into $k$ sets, or 'folds,' and let each take a turn as the test set, using a model
+trained on everything else. The example below illustrates this process using scikit-learn's
+`StratifiedKFold`. In addition to splitting into $k$ folds, this time, we'll stratify the folds by
+prevalence.
+
+`skf.split()` hands back the row positions of the training and test points for one fold at a time.
+`enumerate(..., start=1)` also counts the folds (1, 2, ...) as we loop, and `_` is the usual name
+for a value we don't need. We use the loop to record each point's fold number.
+
+```{python}
+k = 5
+# StratifiedKFold keeps about the same proportion of presences in every fold
+skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=4321)
+fold_assgn = np.zeros(n_points, dtype=int)
+for fold, (_, test_positions) in enumerate(skf.split(modeling_df, modeling_df["presAbs"]), start=1):
+    fold_assgn[test_positions] = fold
+print(pd.crosstab(fold_assgn, modeling_df["presAbs"], rownames=["fold"]))
+
+# plot the folds, each in a different color
+fold_colors = plt.cm.hsv(np.linspace(0, 1, k, endpoint=False))  # like R's rainbow(k)
+ax = sdm.plot_map(env_stack["Annual.Mean.Temperature"], env_stack, title="Annual.Mean.Temperature")
+for f in range(1, k + 1):
+    in_fold = fold_assgn == f
+    ax.scatter(modeling_df.loc[in_fold, "x"], modeling_df.loc[in_fold, "y"], s=8,
+               color=fold_colors[f - 1], label=f"fold {f}")
+ax.legend(loc="lower left", fontsize=8);
+```
+
+Here, we iterate over the folds, letting each take its turn as the test set while we train on all
+the others. In each case, we can record the test predictions to aggregate later and/or measure
+performance for the test fold individually.
+
+```{python}
+# set up an array to store the test metric for each fold
+fold_aucs = np.zeros(k)
+# also collect all the predictions into a single array
+# (this array will be filled bit by bit over the k folds)
+cv_preds = np.zeros(n_points)
+# loop over the folds, training on NOT this fold and testing on this fold
+for f in range(1, k + 1):
+    in_fold = (fold_assgn == f)
+    mod_f = fit_glm(model_vars, modeling_df[~in_fold])
+    pred_f = predict_glm(mod_f, model_vars, modeling_df[in_fold])
+    cv_preds[in_fold] = pred_f
+    fold_aucs[f - 1] = roc_auc_score(modeling_df["presAbs"][in_fold], pred_f)
+
+# we can get a single AUC from the vector of predictions we collected over the folds
+print_auc(modeling_df["presAbs"], cv_preds)
+```
+
+```{python}
+# or we can average the individual AUCs over the folds
+print(fold_aucs)
+print(fold_aucs.mean())
+print(fold_aucs.std(ddof=1))  # ddof=1 gives the sample standard deviation, like R's sd()
+```
+
+> **Exercise 3:** Try this with a few different numbers of folds. Report on your observations. What
+> are some considerations that might guide your choice of the number of folds?
+
+# BONUS SECTION (optional): BlockCV
+
+Those of you that are particularly interested in structured CV may wish to explore spatial
+blocking. In R, the blockCV package (Valavi et al. 2019) builds spatial blocks (squares or
+hexagons of a chosen size), assigns whole blocks to folds, and can estimate the range of spatial
+autocorrelation in the predictors to help choose the block size. There is no equivalent package in
+our Python toolkit, but the core idea is easy to build ourselves as a stand-in:
+
+1. Cut the map into square blocks of `block_size` degrees and give each point the ID of its block.
+2. Use scikit-learn's `GroupKFold`, which puts all points of a group (here, a block) in the same
+   fold.
+
+Some differences from blockCV: the R version uses 500 km hexagons and assigns blocks to folds at
+random (keeping the most even of 50 tries), while `GroupKFold` assigns blocks so that the folds
+have similar numbers of points, with no randomness. Also, a degree of longitude gets shorter toward
+the poles, so our "square" blocks are narrower (in km) in the north.
+
+```{python}
+block_size = 5  # degrees; 5 degrees of latitude is about 550 km
+block_col = np.floor(modeling_df["x"] / block_size).astype(int)
+block_row = np.floor(modeling_df["y"] / block_size).astype(int)
+block_id = block_col.astype(str) + "_" + block_row.astype(str)  # e.g. "-25_9"
+print(block_id.nunique(), "blocks contain points")
+
+gkf = GroupKFold(n_splits=5)
+spatial_folds = np.zeros(n_points, dtype=int)
+for fold, (_, test_positions) in enumerate(gkf.split(modeling_df, groups=block_id), start=1):
+    spatial_folds[test_positions] = fold
+print(pd.crosstab(spatial_folds, modeling_df["presAbs"], rownames=["fold"]))
+
+ax = sdm.plot_map(env_stack["Annual.Mean.Temperature"], env_stack, title="Spatial blocks",
+                  cmap="Greys", colorbar=False)
+for f in range(1, 6):
+    in_fold = spatial_folds == f
+    ax.scatter(modeling_df.loc[in_fold, "x"], modeling_df.loc[in_fold, "y"], s=8,
+               color=fold_colors[f - 1], label=f"fold {f}")
+ax.set_xticks(np.arange(-170, -45, block_size), minor=True)  # draw the block edges
+ax.set_yticks(np.arange(5, 75, block_size), minor=True)
+ax.grid(which="minor", color="grey", linewidth=0.3)
+ax.legend(loc="lower left", fontsize=8);
+# spatial_folds holds the fold number of each point, like fold_assgn above
+```
+
+blockCV's `cv_spatial_autocor()` estimates how far apart two places must be before the
+environmental values stop being similar (the *range* of spatial autocorrelation), by fitting a
+variogram to each layer. As a simpler look at the same idea, here is an *empirical semivariogram*
+for the three variables in the true model: for pairs of random cells, half the average squared
+difference in a variable, plotted against the distance between the cells. Where a curve levels off
+is roughly the autocorrelation range. (This takes a few seconds: 2,000 cells make about 2 million
+pairs.)
+
+```{python}
+cells = env_stack.sample_random(2000, seed=97531)
+lon = np.radians(cells["x"].to_numpy())
+lat = np.radians(cells["y"].to_numpy())
+pairs = np.triu_indices(len(cells), k=1)  # every pair of cells, counted once
+i, j = pairs
+# great-circle distance between the two cells of each pair, in km (the haversine formula)
+a = (np.sin((lat[i] - lat[j]) / 2) ** 2
+     + np.cos(lat[i]) * np.cos(lat[j]) * np.sin((lon[i] - lon[j]) / 2) ** 2)
+dist_km = 2 * 6371 * np.arcsin(np.sqrt(a))
+
+bins = np.arange(0, 4001, 100)  # 100 km distance classes
+bin_of_pair = np.digitize(dist_km, bins)
+bin_mid = bins[:-1] + 50
+
+fig, ax = plt.subplots(figsize=(7, 4))
+for name in true_vars:
+    z = cells[name].to_numpy()
+    half_sq_diff = 0.5 * (z[i] - z[j]) ** 2
+    semivariance = [half_sq_diff[bin_of_pair == b].mean() for b in range(1, len(bins))]
+    ax.plot(bin_mid, semivariance, marker=".", label=name)
+ax.set_xlabel("Distance between cells (km)")
+ax.set_ylabel("Semivariance")
+ax.legend(fontsize=8);
+```
+
+Over a whole continent, a variable that changes along a broad gradient (like minimum temperature,
+which rises steadily from north to south) keeps increasing with distance and never levels off.
+blockCV runs into the same thing: its fitted ranges for such layers can be implausibly large. So
+choosing a block size takes judgment, not just a formula.
+
+# Turn in
+
+**(a Canvas discussion post, by the due date on Canvas)** Please post to the online discussion of
+this lab. Please include brief descriptions of your exploration of the exercises. Please also
+include, if applicable:
+
+* Any key take-aways from this lab that you want to remember for any future projects you may
+  conduct in which you use species distribution models.
+* Any remaining questions or confusions do you have that you might like to learn more about.
+
+# Further Resources
+
+Allouche, O., Tsoar, A., & Kadmon, R. (2006). Assessing the accuracy of species distribution
+models: Prevalence, kappa and the true skill statistic (TSS). Journal of Applied Ecology, 43(6),
+1223-1232.
+
+Bahn, V., & McGill, B. J. (2013). Testing the predictive performance of distribution models.
+Oikos, 122, 321–331.
+
+Davis, J., & Goadrich, M. (2006). The Relationship Between Precision-Recall and ROC Curves.
+Proceedings of the 23rd International Conference on Machine Learning -- ICML'06, 233-240.
+
+Fielding, A. H., & Bell, J. F. (1997). A review of methods for the assessment of prediction errors
+in conservation presence / absence models. Environmental Conservation, 24(1), 38-49.
+
+Hijmans, R. J. (2012). Cross-validation of species distribution models: Removing spatial sorting
+bias and calibration with a null model. Ecology, 93(3), 679–688.
+
+Liu, C., White, M., & Newell, G. (2011). Measuring and comparing the accuracy of species
+distribution models with presence-absence data. Ecography, 34(2), 232-243.
+
+Lobo, J. M., Jimenez-Valverde, A., & Real, R. (2008). AUC: A misleading measure of the performance
+of predictive distribution models. Global Ecology and Biogeography, 17(2), 145-151.
+
+Peterson, A. T., Papes, M., & Soberon, J. (2008). Rethinking receiver operating characteristic
+analysis applications in ecological niche modeling. Ecological Modelling, 213, 63–72.
+
+Roberts, D. R., et al (2017). Cross-validation strategies for data with temporal, spatial,
+hierarchical, or phylogenetic structure. Ecography, 40(8), 913–929.
+
+Santika, T. (2011). Assessing the effect of prevalence on the predictive performance of species
+distribution models using simulated data. Global Ecology and Biogeography, 20(1), 181-192.
+
+Valavi, R., Elith, J., Lahoz-Monfort, J. J., & Guillera-Arroita, G. (2019). blockCV: An r package
+for generating spatially or environmentally separated folds for k-fold cross-validation of species
+distribution models. Methods in Ecology and Evolution, 10(2), 225–232.
+
+Wikipedia links:
+
+* [Classifier evaluation](https://en.wikipedia.org/wiki/Evaluation_of_binary_classifiers)
+* [Cohen's Kappa](https://en.wikipedia.org/wiki/Cohen%27s_kappa)
+* [Mutual information](https://en.wikipedia.org/wiki/Mutual_information)
+* [ROC curves](https://en.wikipedia.org/wiki/Receiver_operating_characteristic)

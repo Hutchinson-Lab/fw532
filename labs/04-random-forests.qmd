@@ -1,0 +1,176 @@
+---
+title: "Lab 4: Random Forests"
+subtitle: "Grow hundreds of trees, let them vote, and find out what the forest learned"
+description: "Fit random forests to simulated presence/absence and abundance data, and use out-of-bag error, variable importance, partial dependence, and proximities to understand them."
+image: images/lab04.png
+order: 4
+---
+
+::: {.lab-meta}
+[Week 3]{} [Readings: Cutler et al. (2007); Valavi et al. (2021)]{} [Methods: random forests, bagging, out-of-bag error, variable importance]{} [R · Python]{}
+:::
+
+## Why this lab?
+
+A single classification tree (Lab 3) is easy to read, but it is unstable. Change a few data points and you can get a very different tree, with different splits and different predictions. Statisticians call this *high variance*. A random forest keeps what trees do well (they capture nonlinear responses and interactions without you specifying them) and fixes the instability by averaging hundreds of trees, each grown a little differently.
+
+Random forests are among the most widely used machine-learning methods in ecology. They often predict well with default settings, have few tuning parameters, and come with built-in tools: an internal estimate of prediction error, variable importance, and partial dependence plots (Cutler et al. 2007).
+
+"Works well by default" isn't the same as "always works", though. Valavi et al. (2021) showed that random forests with default settings perform poorly on presence-background data, and that a small change to how each tree's data are sampled fixes much of the problem. To make changes like that, you need to know how the forest is built. That is the goal of this lab.
+
+## Key concepts
+
+### How a random forest is built
+
+```{mermaid}
+%%| fig-width: 7
+flowchart LR
+  D["Training data<br/>(n points)"] --> B1["Bootstrap<br/>sample 1"]
+  D --> B2["Bootstrap<br/>sample 2"]
+  D --> B3["… sample B"]
+  B1 --> T1["Tree 1"]
+  B2 --> T2["Tree 2"]
+  B3 --> T3["Tree B"]
+  T1 --> V["Vote or<br/>average"]
+  T2 --> V
+  T3 --> V
+  V --> P["Prediction"]
+```
+
+Each tree is grown on its own *bootstrap sample* of the data, and at every split it may only choose among a few randomly selected predictors. Trees are grown deep (not pruned). To predict, every tree makes a prediction and the forest combines them.
+
+### Bootstrap samples and out-of-bag data
+
+A bootstrap sample draws $n$ points *with replacement* from the $n$ training points, so some points appear several times and others not at all. The chance that a particular point is never drawn is
+
+$$
+\left(1 - \frac{1}{n}\right)^n \;\longrightarrow\; e^{-1} \approx 0.368 \quad \text{as } n \text{ grows}.
+$$
+
+With $n = 500$ this is already 0.3675. So each tree sees about **63.2%** of the distinct data points; the other **36.8%** are *out-of-bag* (OOB) for that tree. The lab starts with a short experiment that shows this.
+
+### Bagging reduces variance
+
+Averaging many trees fit to bootstrap samples is called *bagging* (bootstrap aggregating). A deep tree has low bias but high variance, and averaging cancels much of that variance. If $B$ predictions each have variance $\sigma^2$ and pairwise correlation $\rho$, their average has variance
+
+$$
+\rho\,\sigma^2 + \frac{1-\rho}{B}\,\sigma^2 .
+$$
+
+Adding trees (larger $B$) shrinks only the second term. Once the forest is large, more trees change little. They don't cause overfitting, but they don't help much either (in the lab, 500 and 5000 trees give nearly identical predictions). The first term is set by how similar the trees are, which is why random forests also try to make the trees different from each other.
+
+### Random predictor subsets (mtry) decorrelate the trees
+
+At each split, a random forest considers only `mtry` randomly chosen predictors instead of all $p$. Strong predictors then can't dominate every tree, so the trees are less correlated (smaller $\rho$) and their average is more stable. With `mtry` $= p$, a random forest is plain bagging. A small `mtry` decorrelates more, but if only a few predictors matter, a split may often have none of them to choose from.
+
+The software defaults differ, which matters when you compare results across packages:
+
+| Setting | randomForest (R) | ranger (R) | scikit-learn (Python) |
+|---|---|---|---|
+| Number of trees | `ntree = 500` | `num.trees = 500` | `n_estimators = 100` |
+| Predictors per split | `mtry`: $\lfloor\sqrt{p}\rfloor$ (classification), $\lfloor p/3 \rfloor$ (regression) | `mtry`: $\lfloor\sqrt{p}\rfloor$ for both | `max_features`: `"sqrt"` (classification), `1.0` = all $p$ (regression) |
+| Node-size limit | `nodesize`: 1 (classification), 5 (regression) | `min.node.size`: 1 / 5 | `min_samples_split = 2`, `min_samples_leaf = 1` |
+| Points per tree | `sampsize` | `sample.fraction` | `max_samples` |
+| Processor cores | 1 | all (`num.threads`) | 1 unless `n_jobs = -1` |
+
+With our 20 predictors, randomForest uses `mtry` = 4 for classification and 6 for regression. scikit-learn's regression default uses all 20, so the Python lab sets `max_features` to match R.
+
+### Ensemble predictions: votes, probabilities, and two kinds of forest
+
+In a **classification forest**, each tree predicts a class and the forest takes a majority vote. The proportion of trees voting "presence" is a score between 0 and 1 that you can use for ROC curves and maps. (scikit-learn averages each tree's predicted probabilities instead of counting votes; with fully grown trees the two are essentially the same.)
+
+You can also fit a **regression forest** to the same 0/1 data. Each leaf then holds the proportion of presences among its training points, and the forest averages these proportions. Both are used for species distribution models; the lab compares them by AUC.
+
+### OOB error: built-in validation
+
+Each data point can be predicted using only the trees for which it was out-of-bag, that is, trees that never saw it. Comparing these OOB predictions with the observations gives the **OOB error**. Cutler et al. (2007) describe this as essentially a cross-validated estimate that comes free with the fit. One caveat: like random cross-validation, it treats data points as independent. With spatially autocorrelated data, nearby points end up on both sides of the in-bag/out-of-bag split, so OOB error can be optimistic about predicting to new areas (Roberts et al. 2017; Lab 2).
+
+### Variable importance
+
+randomForest reports two measures, and scikit-learn has versions of both:
+
+* **Permutation importance** (*MeanDecreaseAccuracy*, or *%IncMSE* for regression). Shuffle one predictor's values among the out-of-bag points, so it no longer carries information, and measure how much the error increases (Cutler et al. 2007). A large increase means the forest relies on that predictor.
+* **Impurity importance** (*MeanDecreaseGini*, or *IncNodePurity*). Add up how much the splits on each predictor reduce node impurity, averaged over trees. It is fast, but it is computed on the training data and tends to favor predictors with many possible split points.
+
+::: {.concept}
+**Importance with correlated predictors.** Our 20 climate layers are strongly correlated, so a forest can use several of them almost interchangeably. Importance then gets shared among correlated variables. Cutler et al. (2007) see this as an advantage over stepwise selection, which tends to keep only one of a correlated group. But it also means a variable that truly drives occurrence can look less important than it is, and a correlated stand-in can rank high. Shuffling one variable while its correlates stay fixed also creates combinations of conditions that don't exist in nature. Importance tells you what the model uses, not what causes the species' distribution. In the lab, check whether the three variables used to simulate the species come out on top.
+:::
+
+### Partial dependence
+
+A partial dependence plot shows the forest's average prediction as one predictor $x_j$ varies:
+
+$$
+\bar f_j(x) = \frac{1}{n}\sum_{i=1}^{n} \hat f\big(x,\; \mathbf{x}_{i,-j}\big),
+$$
+
+that is, set $x_j = x$ for every data point, keep the other predictors at their observed values, predict, and average. It shows "the dependence of the probability of presence on one predictor variable after averaging out the effects of the other predictor variables" (Cutler et al. 2007). Averaging can hide interactions, and with correlated predictors the curve can rest on unrealistic combinations of values. Watch the scale: randomForest's `partialPlot()` shows classification forests on a logit scale, while scikit-learn and pdp show predicted values directly.
+
+### Proximity and class overlap
+
+The **proximity** of two data points is the proportion of trees in which they land in the same leaf. randomForest counts only trees for which both points were out-of-bag. Points the forest treats alike have proximity near 1. Turning $1 - \text{proximity}$ into a distance and applying multidimensional scaling (MDS) gives a 2-D picture of how the forest sees the data. If presences and absences are mixed together in that picture, the classes **overlap**: they occur under similar conditions, and no model can separate them cleanly.
+
+### Random forests for presence-only and imbalanced data
+
+Presence-only SDMs compare presence records with *background* points sampled from the whole study region, often thousands of background points against tens or hundreds of presences. Valavi et al. (2021) identify two problems for random forests with such data:
+
+* **Class imbalance.** Most points in every bootstrap sample are background points.
+* **Class overlap.** The background describes the environments available, so many background points sit in the same environments as the presences. Fully grown trees keep splitting to separate them, which overfits.
+
+Their remedy is **down-sampling**: grow each tree on a bootstrap sample with the same number of presences and background points (a "balanced" random forest). Each tree is balanced, and across the many trees the forest still uses all the background points. In a large benchmark, down-sampling moved random forests from the worst performers on presence-background data to among the best (Valavi et al. 2022). In R you control this with `sampsize` (randomForest) or `sample.fraction` (ranger), which the lab's exercise points to.
+
+## What you'll do
+
+1. Simulate presence/absence data from the nonlinear virtual species of Lab 3 (a quadratic term and an interaction) and split it into training and test sets.
+2. Check by experiment that about 63% of points land in each bootstrap sample.
+3. Fit a classification forest. Look at OOB error as trees are added, the test confusion matrix, and AUC, and compare it with a regression forest on the same 0/1 data.
+4. Change the number of trees (500 vs. 5000) and `mtry` (2, 4, 8).
+5. Interpret the forest with variable importance, partial dependence, and an MDS plot of proximities, and map its predictions next to the true surface.
+6. Simulate Poisson abundances and fit a regression forest; compare OOB and test MSE.
+7. Compare speed: randomForest vs. ranger in R, one core vs. all cores in Python.
+8. **Exercise:** explore an aspect of random forests you're curious about, such as class-balanced sampling.
+
+## Get the starter code
+
+Both versions do the same analysis step by step. Pick the language you're learning (or try both!). New to the course? Start with [Get set up](../setup.qmd).
+
+::: {.starter-code}
+::: {.track}
+#### R
+
+[Read the R lab](../r/lab04-random-forests.qmd){.btn .btn-primary}
+[R starter kit (.zip)](../downloads/fw532-R-labs.zip){.btn .btn-outline-primary}
+
+In the kit, open `fw532.Rproj`, then `r/lab04-random-forests.qmd`. Uses **randomForest**, **ranger**, **pdp**, **tictoc**, **caret**, **pROC**, and **terra**.
+:::
+
+::: {.track .python}
+#### Python
+
+[Read the Python lab](../python/lab04-random-forests.qmd){.btn .btn-primary}
+[Open in Colab](https://colab.research.google.com/github/Hutchinson-Lab/fw532/blob/main/python/lab04-random-forests.ipynb){.btn .btn-outline-primary}
+[Python starter kit (.zip)](../downloads/fw532-python-labs.zip){.btn .btn-outline-primary}
+
+Open `python/lab04-random-forests.ipynb`. Uses **scikit-learn** (random forests, permutation importance, partial dependence), **numpy**, **pandas**, and **matplotlib**.
+:::
+:::
+
+## Turn in
+
+Post to the Canvas discussion for this lab by the due date on Canvas. Include brief descriptions of your exploration of the exercise, with any relevant plots. If applicable, also include:
+
+* key take-aways you'd want to remember for a future SDM project, and
+* remaining questions or confusions you'd like to learn more about.
+
+## Readings & resources
+
+* Cutler, D. R., Edwards, T. C., Jr., Beard, K. H., Cutler, A., Hess, K. T., Gibson, J., & Lawler, J. J. (2007). Random forests for classification in ecology. *Ecology*, 88(11), 2783–2792. <https://doi.org/10.1890/07-0539.1>
+* Valavi, R., Elith, J., Lahoz-Monfort, J. J., & Guillera-Arroita, G. (2021). Modelling species presence-only data with random forests. *Ecography*, 44, 1731–1742. <https://doi.org/10.1111/ecog.05615>
+* Valavi, R., Guillera-Arroita, G., Lahoz-Monfort, J. J., & Elith, J. (2022). Predictive performance of presence-only species distribution models: a benchmark study with reproducible code. *Ecological Monographs*, 92, e01486. <https://doi.org/10.1002/ecm.1486>
+* Roberts, D. R., Bahn, V., Ciuti, S., et al. (2017). Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure. *Ecography*, 40, 913–929. <https://doi.org/10.1111/ecog.02881>
+* Evans, J. S., Murphy, M. A., Holden, Z. A., & Cushman, S. A. (2010). Modeling species distribution and change using random forest. In *Predictive Species and Habitat Modeling in Landscape Ecology: Concepts and Applications* (pp. 139–159). Springer. <https://doi.org/10.1007/978-1-4419-7390-0_8>
+* Prasad, A. M., Iverson, L. R., & Liaw, A. (2006). Newer classification and regression tree techniques: Bagging and random forests for ecological prediction. *Ecosystems*, 9(2), 181–199.
+* Liaw, A., & Wiener, M. (2002). Classification and regression by randomForest. *R News*, 2(3), 18–22.
+* Breiman, L. (2002). [Manual on setting up, using, and understanding random forests v3.1](https://www.stat.berkeley.edu/~breiman/Using_random_forests_V3.1.pdf).
+* Breiman, L. (2001). Random forests. *Machine Learning*, 45, 5–32. <https://doi.org/10.1023/A:1010933404324>
+* scikit-learn user guide: [Random forests](https://scikit-learn.org/stable/modules/ensemble.html#random-forests) and [Permutation feature importance](https://scikit-learn.org/stable/modules/permutation_importance.html)

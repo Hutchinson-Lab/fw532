@@ -1,0 +1,636 @@
+---
+title: "Demo: A Model Bake-off with Partial Dependence Plots"
+subtitle: "FW 532 · Python version"
+---
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* Python packages: numpy, pandas, matplotlib, statsmodels, scikit-learn, elapid, rasterio (see
+  `requirements.txt`)
+* The course helper module `sdmlab.py` (in the same folder as this notebook)
+
+Run the cells in order from top to bottom. A few of the tuning cells take a minute or two.
+
+```{python}
+# Running on Google Colab? This cell downloads the course files. (Anywhere else it does nothing.)
+import os, sys
+if "google.colab" in sys.modules:
+    if not os.path.exists("/content/fw532"):
+        !git clone -q --depth 1 https://github.com/Hutchinson-Lab/fw532.git /content/fw532
+        %pip install -q rasterio elapid
+    os.chdir("/content/fw532/python")
+```
+
+# Setup
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.inspection import partial_dependence
+from sklearn.metrics import roc_auc_score, roc_curve
+from elapid import MaxentModel   # Maxent
+
+import sdmlab as sdm   # course helpers for rasters
+
+env_stack = sdm.load_env()
+
+# scale variables
+env_stack = env_stack.scale()
+pred_vars = env_stack.names   # the 20 environmental variables
+```
+
+# Simulate Data
+
+```{python}
+# define logistic function
+def logistic(x):
+    return np.exp(x) / (1 + np.exp(x))
+```
+
+```{python}
+# get points
+n_points = 3000
+sim_pts = env_stack.sample_random(n_points, seed=1234)
+
+intercept = 0
+beta1 = -0.5
+beta2 = 0.5
+beta3 = -1
+p_occ = logistic(intercept
+                 + beta1 * sdm.scale(env_stack["elevation"])
+                 + beta2 * sdm.scale(env_stack["Annual.Precipitation"])
+                 + beta3 * sdm.scale(env_stack["Annual.Precipitation"]) ** 2)
+
+# get the values that correspond to the points we selected:
+p_occs = sdm.extract(p_occ, env_stack, sim_pts["x"], sim_pts["y"])
+
+# sample from these probabilities (a new seed for a new random step; see Lab 1):
+rng = np.random.default_rng(5678)
+pres_abs = rng.binomial(n=1, p=p_occs)
+
+# put response and variables together in a DataFrame:
+modeling_df = sim_pts.copy()
+modeling_df.insert(0, "presAbs", pres_abs)
+
+# plot the result
+ax = sdm.plot_map(p_occ, env_stack, cmap="Greys")
+absent = modeling_df["presAbs"] == 0
+ax.scatter(modeling_df.loc[absent, "x"], modeling_df.loc[absent, "y"], s=2, color="blue", label="non-detection")
+ax.scatter(modeling_df.loc[~absent, "x"], modeling_df.loc[~absent, "y"], s=2, color="red", label="detection")
+ax.legend(loc="center left");
+```
+
+Next we split the points into training, tuning/validation, and test sets of 1000 points each.
+`sample_random()` returns the points in random order, so each block of rows is a random subset.
+`.iloc[a:b]` picks rows by position: rows a, a+1, ..., b-1 (Python counts from 0 and leaves out
+the end point).
+
+```{python}
+# split into training, tuning/validation, and test
+train_data = modeling_df.iloc[:n_points // 3]
+val_data = modeling_df.iloc[n_points // 3:2 * n_points // 3]
+test_data = modeling_df.iloc[2 * n_points // 3:]
+print(len(train_data), len(val_data), len(test_data))
+```
+
+In simulation, we can evaluate in a number of ways. We can assess predictive power, just like with
+real data. But we can also look at whether the correct environmental relationships are estimated.
+In the above, we used a simple parametric equation to generate the data. For models of this same
+form, we can look directly at whether the estimated coefficients match the true parameters. But
+some types of models don't produce coefficients for comparison.
+
+Partial dependence plots (PDPs) can be a useful tool for examining the learned relationships.
+scikit-learn can compute these from fitted models, but since our data-generating equation is not in
+the format of a model, we'll make this first one "by hand." We'll set up sequences of values for the
+two relevant variables. For every possible pair of values, we'll compute the probability of
+occurrence. Then we can make a 3-d plot of the probability surface in feature space (since we only
+have 2 relevant features to consider).
+
+We'll draw many of these surfaces, so we first write a small function for the plot. Every surface
+uses the same 0-1 scale for height and color, so the plots are easy to compare.
+
+```{python}
+def plot_pdp(grid1, grid2, pd_values, title, xlabel="elevation", ylabel="Annual.Precipitation"):
+    """Draw a 2-D (partial dependence) surface in 3-D, on a common 0-1 scale.
+
+    pd_values[i, j] is the value at grid1[i], grid2[j].
+    """
+    X, Y = np.meshgrid(grid1, grid2, indexing="ij")   # X[i, j] = grid1[i], Y[i, j] = grid2[j]
+    fig = plt.figure(figsize=(7, 5.5))
+    ax = fig.add_subplot(projection="3d")
+    surf = ax.plot_surface(X, Y, pd_values, cmap="viridis", vmin=0, vmax=1, edgecolor="none")
+    ax.set_zlim(0, 1)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_zlabel("p(spp)")
+    ax.set_title(title)
+    ax.view_init(elev=25, azim=-127)
+    fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1)
+    plt.show()
+```
+
+```{python}
+granularity = 51
+x = np.linspace(modeling_df["elevation"].min(), modeling_df["elevation"].max(), granularity)
+y = np.linspace(modeling_df["Annual.Precipitation"].min(), modeling_df["Annual.Precipitation"].max(),
+                granularity)
+
+pdp_truth = np.zeros((len(x), len(y)))
+for i in range(len(x)):
+    for j in range(len(y)):
+        pdp_truth[i, j] = logistic(intercept
+                                   + beta1 * x[i]
+                                   + beta2 * y[j]
+                                   + beta3 * y[j] ** 2)
+
+plot_pdp(x, y, pdp_truth, "Truth")
+```
+
+We can see that this species prefers lower elevations overall, and that there's a "sweet spot" for
+precipitation levels.
+
+For the fitted models, we'll compute PDPs with the function below. It follows the recipe described
+later in this demo: for each pair of values on the grid, set elevation and Annual.Precipitation to
+those values for ALL of the training points, predict, and average. (To save time it handles a whole
+row of the grid at once, by stacking copies of the data.) It works with any model, as long as we
+give it a `predict` function that takes a DataFrame and returns probabilities of presence.
+
+```{python}
+def partial_dependence_2d(predict, data, var1="elevation", var2="Annual.Precipitation",
+                          grid_resolution=51):
+    """Two-variable partial dependence, averaged over the rows of `data`.
+
+    Returns the two grids and a matrix pd_values with pd_values[i, j] for (grid1[i], grid2[j]).
+    """
+    grid1 = np.linspace(data[var1].min(), data[var1].max(), grid_resolution)
+    grid2 = np.linspace(data[var2].min(), data[var2].max(), grid_resolution)
+    pd_values = np.zeros((grid_resolution, grid_resolution))
+    n = len(data)
+    for i, v1 in enumerate(grid1):
+        temp = pd.concat([data] * grid_resolution, ignore_index=True)   # one copy of the data per grid2 value
+        temp[var1] = v1
+        temp[var2] = np.repeat(grid2, n)       # first n rows get grid2[0], next n get grid2[1], ...
+        preds = np.asarray(predict(temp))
+        pd_values[i, :] = preds.reshape(grid_resolution, n).mean(axis=1)   # average within each copy
+    return grid1, grid2, pd_values
+```
+
+First, we can try a parametric regression model, with the correctly specified model. (Note that the
+form of the model below matches the form of the data-generating equation above, with the correct
+quadratic term.) Here, there is no model misspecification, and the error in the estimated
+coefficients occurs because we are estimating these population parameters from a finite sample.
+With more data points, the coefficients should get closer to the true values, and with fewer data
+points, we'd expect more variability.
+
+statsmodels needs the columns of the model (the *design matrix*) spelled out, so we write a small
+function that builds them from a DataFrame, including the squared term. (This plays the role of
+`I(Annual.Precipitation^2)` in an R formula.) Building the squared column inside the function matters
+for the PDP: when the PDP changes Annual.Precipitation, its square changes with it.
+`has_constant="add"` makes sure the intercept column is always added: in a PDP, elevation is set to
+one value for every row, and `add_constant()` would otherwise mistake that column for an intercept.
+
+```{python}
+def design_correct(df):
+    """Intercept, elevation, Annual.Precipitation, and its square."""
+    X = df[["elevation", "Annual.Precipitation"]].copy()
+    X["Annual.Precipitation^2"] = X["Annual.Precipitation"] ** 2
+    return sm.add_constant(X, has_constant="add")
+
+glm_correct = sm.GLM(train_data["presAbs"], design_correct(train_data),
+                     family=sm.families.Binomial()).fit()
+print(glm_correct.summary())
+```
+
+For each model, we'll produce predicted probabilities of occurrence at each test point too, for
+predictive performance comparisons later. (`X @ params` multiplies each column by its coefficient and
+adds them up; `glm_correct.predict(design_correct(test_data))` would give the same answer.)
+
+```{python}
+preds_glm_correct = logistic(design_correct(test_data) @ glm_correct.params)
+```
+
+In this case, comparing the estimated and true values of the coefficients is a great, direct way to
+compare the models. But for comparison with other approaches where this is not available, let's make
+a PDP as well.
+
+(Note that the PDP calculations can take a little time.)
+
+```{python}
+def predict_glm_correct(df):
+    return glm_correct.predict(design_correct(df))
+
+pdp_glm_correct = partial_dependence_2d(predict_glm_correct, train_data)
+plot_pdp(*pdp_glm_correct, "GLM, correctly specified")
+```
+
+(`*pdp_glm_correct` unpacks the three results -- the two grids and the matrix -- into the first three
+arguments of `plot_pdp()`.)
+
+Really similar to the truth, as we'd expect. If you are in a position with sufficient prior
+knowledge to specify your parametric model correctly, go for it!
+
+What happens if we make a mistake though? Here's a parametric regression model where we've left off
+the quadratic term. This is model misspecification. Even with infinite data, this formula cannot
+represent the true model correctly. It will find the best possible linear approximation to the true
+model.
+
+```{python}
+def design_misspec(df):
+    return sm.add_constant(df[["elevation", "Annual.Precipitation"]], has_constant="add")
+
+glm_misspec = sm.GLM(train_data["presAbs"], design_misspec(train_data),
+                     family=sm.families.Binomial()).fit()
+print(glm_misspec.summary())
+
+preds_glm_misspec = logistic(design_misspec(test_data) @ glm_misspec.params)
+```
+
+So what does that probability surface look like?
+
+```{python}
+def predict_glm_misspec(df):
+    return glm_misspec.predict(design_misspec(df))
+
+pdp_glm_misspec = partial_dependence_2d(predict_glm_misspec, train_data)
+plot_pdp(*pdp_glm_misspec, "GLM, no quadratic term")
+```
+
+Even the misspecified model above at least narrowed to the two relevant variables. What if we throw
+in all variables from our raster stack?
+
+```{python}
+glm_misspec_all = sm.GLM(train_data["presAbs"], sm.add_constant(train_data[pred_vars]),
+                         family=sm.families.Binomial()).fit()
+print(glm_misspec_all.summary())
+```
+
+Look at the estimates and, especially, the standard errors for Max.Temperature.of.Warmest.Month,
+Min.Temperature.of.Coldest.Month, and Temperature.Annual.Range: they are far larger than for any
+other variable. As we've
+discussed, having highly correlated variables in a model is always hard from an interpretation
+perspective, regardless of model form. But some models can be fitted just fine in the presence of
+correlated variables. This glm model however, struggles to even fit the model.
+Temperature.Annual.Range is *defined* as Max.Temperature.of.Warmest.Month minus
+Min.Temperature.of.Coldest.Month, so these three variables are perfectly collinear (up to tiny
+rounding differences in the data file), and there is no unique best set of coefficients for them.
+(R's `glm()` reports one coefficient as `NA` when variables are exactly collinear; statsmodels uses a
+pseudo-inverse and returns *some* solution without complaint, so you have to spot the problem
+yourself.)
+
+The best way to deal with this would be to examine the correlation matrix, draw on prior knowledge,
+and subset these variables as wisely as we can.
+
+```{python}
+# check out their correlation:
+correl = train_data[pred_vars].corr(method="spearman")
+
+def plot_correlation(correl):
+    fig, ax = plt.subplots(figsize=(9, 8))
+    im = ax.imshow(correl, cmap="RdBu_r", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(correl)), correl.columns, rotation=90, fontsize=8)
+    ax.set_yticks(range(len(correl)), correl.index, fontsize=8)
+    fig.colorbar(im, ax=ax, label="Spearman correlation")
+    plt.show()
+
+plot_correlation(correl)
+```
+
+I'll do this somewhat generously, so that we don't throw away our two relevant variables, but of
+course in practice there is a risk of dropping relevant variables. I'll drop anything that's
+correlated with the correct variables above 0.7 (or below -0.7).
+
+```{python}
+row = correl.loc["Annual.Precipitation"]
+print(row[row.abs() > 0.7])
+row = correl.loc["elevation"]
+print(row[row.abs() > 0.7])
+```
+
+```{python}
+to_drop = ["Precipitation.of.Wettest.Month", "Precipitation.of.Driest.Month",
+           "Precipitation.of.Wettest.Quarter", "Precipitation.of.Driest.Quarter",
+           "Precipitation.of.Warmest.Quarter", "Precipitation.of.Coldest.Quarter"]
+to_keep = [v for v in pred_vars if v not in to_drop]   # a list comprehension: every v not in to_drop
+correl2 = train_data[to_keep].corr(method="spearman")
+plot_correlation(correl2)
+```
+
+A lot of the temperature metrics are also correlated. Let's keep Annual.Mean.Temperature and drop
+anything correlated with it above 0.7 (or below -0.7).
+
+```{python}
+row = correl.loc["Annual.Mean.Temperature"]
+print(row[row.abs() > 0.7])
+print("Temperature.Annual.Range:", round(row["Temperature.Annual.Range"], 2))
+```
+
+Temperature.Annual.Range just misses this cutoff (see its correlation printed above), but it is the
+difference of two variables we just dropped, so we'll drop it too.
+
+```{python}
+to_keep = ["Annual.Mean.Temperature", "Mean.Diurnal.Range",
+           "Mean.Temperature.of.Wettest.Quarter", "Annual.Precipitation",
+           "Precipitation.Seasonality", "elevation"]
+correl3 = train_data[to_keep].corr(method="spearman")
+plot_correlation(correl3)
+```
+
+Let's use this subset below.
+
+```{python}
+glm_misspec_all = sm.GLM(train_data["presAbs"], sm.add_constant(train_data[to_keep]),
+                         family=sm.families.Binomial()).fit()
+print(glm_misspec_all.summary())
+```
+
+```{python}
+preds_glm_misspec_all = logistic(sm.add_constant(test_data[to_keep]) @ glm_misspec_all.params)
+```
+
+Here is the PDP for elevation and Annual.Precipitation from the misspecified model with linear
+effects of other variables:
+
+```{python}
+def predict_glm_misspec_all(df):
+    return glm_misspec_all.predict(sm.add_constant(df[to_keep], has_constant="add"))
+
+pdp_glm_misspec_all = partial_dependence_2d(predict_glm_misspec_all, train_data)
+plot_pdp(*pdp_glm_misspec_all, "GLM, 6 variables, linear terms")
+```
+
+You might ask: how is this related to all the other variables? The answer is: this is the average
+or partial dependence of the probability of occurrence on the joint values of elevation and
+Annual.Precipitation, after accounting for the average effects of the other variables. Each (x,y)
+point in this plot is computed by setting the values of elevation and Annual.Precipitation for ALL
+training points to x and y, leaving the values of the other variables at the training point
+untouched. Then, the probability of occurrence is computed with these specified values of elevation
+and Annual.Precipitation. These probabilities are averaged over all training points. This is
+repeated for all (x,y) pairs represented in the plot.
+
+Now let's move on to some tree-based methods. From here on out, we'll proceed with putting those 6
+variables into the models. The idea is that we're in a setting where we don't have the prior
+knowledge to narrow these down further, and we want to leverage these ML techniques that have some
+built in feature selection/engineering to help out.
+
+For the sake of visualization, we'll fit an individual tree. scikit-learn's `DecisionTreeClassifier`
+doesn't prune by default, while R's `rpart` does (with `cp = 0.01`). We use rpart's default minimum
+node sizes (`minsplit = 20`, `minbucket = 7`) and a small pruning penalty, `ccp_alpha`, which plays
+the role of rpart's `cp` but is on a different scale; 0.003 gives a tree of roughly the size rpart
+grows by default.
+
+```{python}
+cart_all = DecisionTreeClassifier(min_samples_split=20, min_samples_leaf=7, ccp_alpha=0.003,
+                                  random_state=0)
+cart_all.fit(train_data[to_keep], train_data["presAbs"])
+print("number of leaves:", cart_all.get_n_leaves())
+
+# predict_proba gives one column per class (0, 1); column 1 is the probability of presence
+preds_cart_all = cart_all.predict_proba(test_data[to_keep])[:, 1]
+```
+
+```{python}
+def predict_cart_all(df):
+    return cart_all.predict_proba(df[to_keep])[:, 1]
+
+pdp_cart_all = partial_dependence_2d(predict_cart_all, train_data)
+plot_pdp(*pdp_cart_all, "Classification tree")
+```
+
+Blocky. But we know that single trees are not our best bet.
+
+scikit-learn also has a built-in function for partial dependence,
+`sklearn.inspection.partial_dependence()`. For a classifier it averages the predicted probability of
+the second class (here, presence). Let's check that it agrees with our function. (We use it on the
+tree because it is fast; for big forests it is much slower than our function, because it makes a
+separate set of predictions for every grid point.)
+
+```{python}
+pd_sklearn = partial_dependence(cart_all, train_data[to_keep],
+                                features=["elevation", "Annual.Precipitation"],
+                                grid_resolution=51, percentiles=(0, 1),   # grid from min to max
+                                method="brute", response_method="predict_proba")
+print(pd_sklearn["average"].shape)                       # (1 output, 51 elevation values, 51 precipitation values)
+print(np.allclose(pd_sklearn["average"][0], pdp_cart_all[2]))
+```
+
+For the other models, let's do a little parameter tuning on the validation set.
+
+For random forests, let's choose the tuning parameters that produce the best AUC on the validation
+set from among mtry={1,2,3,4,5,6} and ntree={500,1000,2000,4000}. In scikit-learn, `mtry` is
+`max_features` and `ntree` is `n_estimators`. To save time, we grow each forest in stages:
+with `warm_start=True`, calling `fit()` again after increasing `n_estimators` *adds* trees to the
+forest instead of starting over, so we evaluate the forest after 500, 1000, 2000, and 4000 trees.
+(`n_jobs=-1` uses all of your computer's cores. This cell takes a minute or two.)
+
+```{python}
+mtrys = [1, 2, 3, 4, 5, 6]
+ntrees = [500, 1000, 2000, 4000]
+val_aucs = np.zeros((len(mtrys), len(ntrees)))
+for m, mtry in enumerate(mtrys):            # enumerate() gives both the position m and the value mtry
+    rf = RandomForestClassifier(max_features=mtry, warm_start=True, n_jobs=-1, random_state=101)
+    for n, ntree in enumerate(ntrees):
+        rf.set_params(n_estimators=ntree)   # grow the forest to ntree trees
+        rf.fit(train_data[to_keep], train_data["presAbs"])
+        preds = rf.predict_proba(val_data[to_keep])[:, 1]
+        val_aucs[m, n] = roc_auc_score(val_data["presAbs"], preds)
+
+print(pd.DataFrame(val_aucs, index=pd.Index(mtrys, name="mtry"),
+                   columns=pd.Index(ntrees, name="ntree")).round(4))
+best_m, best_n = np.unravel_index(np.argmax(val_aucs), val_aucs.shape)   # row and column of the max
+best_mtry = mtrys[best_m]
+best_ntree = ntrees[best_n]
+print("best mtry:", best_mtry, " best ntree:", best_ntree)
+```
+
+```{python}
+rf_all = RandomForestClassifier(n_estimators=best_ntree, max_features=best_mtry, n_jobs=-1,
+                                random_state=102)
+rf_all.fit(train_data[to_keep], train_data["presAbs"])
+preds_rf_all = rf_all.predict_proba(test_data[to_keep])[:, 1]
+```
+
+A PDP needs a prediction at every training point for every grid point, and a forest with hundreds of
+trees is slow to predict from. To keep this quick, we use a coarser grid (20 × 20 points instead of
+51 × 51), as in the R version.
+
+```{python}
+def predict_rf_all(df):
+    return rf_all.predict_proba(df[to_keep])[:, 1]
+
+pdp_rf_all = partial_dependence_2d(predict_rf_all, train_data, grid_resolution=20)
+plot_pdp(*pdp_rf_all, "Random forest")
+```
+
+For BRTs, let's choose the tuning parameters that produce the best AUC on the validation set from
+among depth={1,2,3}, learning rate={0.001, 0.005, 0.01, 0.05}, and ntrees={500,1000,2000,3000,4000,5000}.
+We use scikit-learn's `GradientBoostingClassifier` with settings that match R's `gbm` defaults:
+`subsample=0.5` (gbm's `bag.fraction`) and `min_samples_leaf=10` (gbm's `n.minobsinnode`). gbm's
+`interaction.depth` is the number of splits in each tree, so a tree of depth $d$ has $d + 1$ leaves:
+`max_leaf_nodes = depth + 1`.
+
+We don't need to fit a separate model for every number of trees: a boosted model with 500 trees is
+just the first 500 trees of a bigger model. So we fit each depth/learning-rate combination once with
+5000 trees, and `staged_predict_proba()` gives the predictions after 1, 2, 3, ... trees; we keep the
+ones we want. (This cell takes a couple of minutes.)
+
+```{python}
+depths = [1, 2, 3]
+lrs = [0.001, 0.005, 0.01, 0.05]
+ntrees = [500, 1000, 2000, 3000, 4000, 5000]
+val_aucs = np.zeros((len(depths), len(lrs), len(ntrees)))
+for d, depth in enumerate(depths):
+    for l, lr in enumerate(lrs):
+        brt = GradientBoostingClassifier(n_estimators=max(ntrees), learning_rate=lr,
+                                         max_leaf_nodes=depth + 1, max_depth=None,
+                                         subsample=0.5, min_samples_leaf=10, random_state=202)
+        brt.fit(train_data[to_keep], train_data["presAbs"])
+        # predictions after 1, 2, 3, ... trees:
+        for n_fitted, preds in enumerate(brt.staged_predict_proba(val_data[to_keep]), start=1):
+            if n_fitted in ntrees:
+                val_aucs[d, l, ntrees.index(n_fitted)] = roc_auc_score(val_data["presAbs"], preds[:, 1])
+
+for d, depth in enumerate(depths):
+    print(f"depth = {depth}")
+    print(pd.DataFrame(val_aucs[d], index=pd.Index(lrs, name="learning rate"),
+                       columns=pd.Index(ntrees, name="ntrees")).round(4), "\n")
+
+best_d, best_l, best_n = np.unravel_index(np.argmax(val_aucs), val_aucs.shape)
+best_depth = depths[best_d]
+best_lr = lrs[best_l]
+best_ntree = ntrees[best_n]
+print("best depth:", best_depth, " best learning rate:", best_lr, " best ntrees:", best_ntree)
+```
+
+```{python}
+brt_all = GradientBoostingClassifier(n_estimators=best_ntree, learning_rate=best_lr,
+                                     max_leaf_nodes=best_depth + 1, max_depth=None,
+                                     subsample=0.5, min_samples_leaf=10, random_state=203)
+brt_all.fit(train_data[to_keep], train_data["presAbs"])
+preds_brt_all = brt_all.predict_proba(test_data[to_keep])[:, 1]
+```
+
+We use a 25 × 25 grid for this PDP to keep it quick. (Unlike R's `pdp` package, which uses a fast
+shortcut for gbm models that averages on the log-odds scale, our function averages probabilities, as
+for every other model.)
+
+```{python}
+def predict_brt_all(df):
+    return brt_all.predict_proba(df[to_keep])[:, 1]
+
+pdp_brt_all = partial_dependence_2d(predict_brt_all, train_data, grid_resolution=25)
+plot_pdp(*pdp_brt_all, "Boosted regression trees")
+```
+
+To use a Maxent model, we can throw away our absence data, keep the presences, and sample background
+data - say, 10,000 background points. Like R's `maxnet()`, we also add any presences that aren't
+already in the background sample to the background. A point's coordinates identify its raster cell,
+so we check the (x, y) pairs. (`zip()` pairs up the two columns, and `set()` makes a collection we
+can check quickly with `in`.)
+
+```{python}
+bkgnd_pts = env_stack.sample_random(10000, seed=2468)   # a new seed for a new random step
+pres_pts = train_data[train_data["presAbs"] == 1]
+
+bkgnd_cells = set(zip(bkgnd_pts["x"], bkgnd_pts["y"]))
+add_to_bkgnd = [(px, py) not in bkgnd_cells for px, py in zip(pres_pts["x"], pres_pts["y"])]
+
+maxent_x = pd.concat([pres_pts[to_keep],                       # presences
+                      bkgnd_pts[to_keep],                      # background
+                      pres_pts.loc[add_to_bkgnd, to_keep]],    # presences added to background
+                     ignore_index=True)
+maxent_y = np.concatenate([np.ones(len(pres_pts)),
+                           np.zeros(len(bkgnd_pts)),
+                           np.zeros(sum(add_to_bkgnd))])
+print("presences:", int(maxent_y.sum()), " background:", int((maxent_y == 0).sum()))
+```
+
+One way to tune Maxent is to try different feature classes, and we can also adjust the
+regularization multiplier. We fit Maxent with the `elapid` package. Its `feature_types` are the
+feature classes (l = linear, q = quadratic, p = product, h = hinge), and `beta_multiplier` is the
+regularization multiplier (`regmult` in R's maxnet). A Python dictionary (`{key: value, ...}`) holds
+the four feature sets under their short names.
+
+```{python}
+feature_sets = {"l": ["linear"],
+                "lq": ["linear", "quadratic"],
+                "lqp": ["linear", "quadratic", "product"],
+                "lqph": ["linear", "quadratic", "product", "hinge"]}
+reg_mults = [0.5, 0.75, 1, 1.25, 1.5]
+
+val_aucs = pd.DataFrame(index=pd.Index(list(feature_sets), name="features"),
+                        columns=pd.Index(reg_mults, name="beta_multiplier"), dtype=float)
+for name, features in feature_sets.items():     # loop over the dictionary's keys and values
+    for rm in reg_mults:
+        maxent = MaxentModel(feature_types=features, beta_multiplier=rm, transform="cloglog")
+        maxent.fit(maxent_x, maxent_y)
+        preds = maxent.predict(val_data[to_keep])    # cloglog output
+        val_aucs.loc[name, rm] = roc_auc_score(val_data["presAbs"], preds)
+
+print(val_aucs.round(4))
+best_fs, best_rm = val_aucs.stack().idxmax()     # row and column names of the largest AUC
+print("best features:", best_fs, " best beta_multiplier:", best_rm)
+```
+
+The validation AUCs change with the feature classes and, a little, with the regularization
+multiplier (across each row). Larger multipliers penalize the coefficients more, so the model keeps fewer
+features and the fitted response is smoother.
+
+> **R vs. Python:** an earlier version of the R demo found that the regularization multiplier made
+> no difference, because the argument was misspelled (`regMult` instead of `regmult`) and R silently
+> passed it along to another function that ignored it. In Python, a misspelled keyword argument
+> usually raises an error (`TypeError: ... got an unexpected keyword argument`), unless the function
+> accepts arbitrary keywords (`**kwargs`).
+>
+> elapid's Maxent is close to, but not the same as, R's maxnet: for example, it uses fewer hinge
+> features per variable by default (`n_hinge_features=10`; maxnet uses 50 knots), and it fits the
+> penalized model with scikit-learn rather than glmnet. Expect similar, not identical, results.
+
+```{python}
+maxent_all = MaxentModel(feature_types=feature_sets[best_fs], beta_multiplier=best_rm,
+                         transform="cloglog")
+maxent_all.fit(maxent_x, maxent_y)
+preds_maxent_all = maxent_all.predict(test_data[to_keep])
+```
+
+elapid's `predict()` returns the cloglog output (0 to 1) that we asked for with
+`transform="cloglog"`, so the PDP is on the same scale as the other models. We average over the 1000
+training points, which, like the background points, are a random sample of the landscape. That puts
+the Maxent PDP on the same footing as the other models, and it is much faster than averaging over all
+10,000+ background points.
+
+```{python}
+def predict_maxent_all(df):
+    return maxent_all.predict(df[to_keep])
+
+pdp_maxent_all = partial_dependence_2d(predict_maxent_all, train_data)
+plot_pdp(*pdp_maxent_all, "Maxent (elapid)")
+```
+
+Finally, let's compare all of the models on the test data. (R's pROC plots specificity, reversed,
+on the x-axis; we plot the false positive rate = 1 - specificity, which gives the same curve.)
+
+```{python}
+test_preds = {"GLM_correct": (preds_glm_correct, "black"),
+              "GLM_Misspec": (preds_glm_misspec, "red"),
+              "GLM_Misspec_all": (preds_glm_misspec_all, "orange"),
+              "CART_all": (preds_cart_all, "brown"),
+              "RF_all": (preds_rf_all, "green"),
+              "BRT_all": (preds_brt_all, "blue"),
+              "maxent_all": (preds_maxent_all, "purple")}
+
+fig, ax = plt.subplots(figsize=(7, 7))
+for name, (preds, color) in test_preds.items():
+    fpr, tpr, _ = roc_curve(test_data["presAbs"], preds)
+    auc = roc_auc_score(test_data["presAbs"], preds)
+    ax.plot(fpr, tpr, color=color, label=f"{name} AUC: {auc:.3f}")
+ax.plot([0, 1], [0, 1], color="grey", linewidth=0.8)
+ax.set_xlabel("False positive rate (1 - specificity)")
+ax.set_ylabel("True positive rate (sensitivity)")
+ax.set_aspect("equal")
+ax.legend(loc="lower right");
+```

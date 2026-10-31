@@ -1,0 +1,190 @@
+---
+title: "Lab 1: Simulation & Types of Data"
+subtitle: "FW 532 · R version"
+---
+
+**Goals:**
+
+* To get comfortable simulating data in R.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* R packages: terra, ggplot2, ggcorrplot, here (run `source("install_packages.R")` once to install everything for the term)
+
+::: {.callout-note collapse="true" title="Working in the course R project"}
+Open `fw532.Rproj` (in RStudio or Positron) before you start. The `here()` function builds file paths starting from the project folder, so the same code works on everyone's computer and you never need to set your working directory. For example, `here("data", "envStack.tif")` points to the data file no matter where you put the project.
+:::
+
+```{r}
+#| message: false
+library(terra)      # rasters (gridded maps)
+library(ggplot2)
+library(ggcorrplot)
+library(here)       # file paths relative to the project folder
+```
+
+Here are a few environmental variables for us to start with. These are climatic variables from WorldClim (averages for 1970-2000; <https://www.worldclim.org/data/bioclim.html>) and elevation, covering roughly North America. The spatial resolution is 10 minutes, which is about 13km at 45 degrees latitude. More generally, you could start with any set of variables at any extent that you wish.
+
+```{r}
+envStack <- rast(here("data", "envStack.tif"))
+names(envStack)
+
+plot(envStack)
+```
+
+(By default `plot()` shows the first 16 layers. Try `plot(envStack, 17:20)` to see the rest, or `plot(envStack$elevation)` for a single layer.)
+
+# A data simulator
+
+Next, let's select some locations to simulate species data. Below, we'll use `set.seed()` so we all get the same results when we use stochastic functions. You'll need to call it immediately preceding the stochastic function call any time you use it. I.e., it is not sufficient to call it just once. The first stochastic function is `spatSample()`, from the terra package, for getting random points from our raster stack.
+
+Let's scale the environmental variables, since we'll work with simple regression frameworks to start.
+
+```{r}
+# scale variables (each layer gets mean 0 and standard deviation 1)
+envStack <- scale(envStack)
+
+nPoints <- 1000
+set.seed(1234) # any number will work as input here; using the same one will give the same results
+simPts <- spatSample(envStack, size = nPoints, method = "random",
+                     na.rm = TRUE, xy = TRUE) # could change this from random to a procedure reflecting sampling bias
+head(simPts[, 1:5])
+
+# plot the points over the first climate raster:
+plot(envStack[[1]])
+points(simPts$x, simPts$y, pch = 20)
+```
+
+`simPts` is a data frame with one row per sampled location: the coordinates (`x` = longitude, `y` = latitude) followed by the value of each environmental layer at that location.
+
+To simulate a species, we'll make up a function to define its probability of occurrence as a function of the environmental variables. Let's look at their correlation as we consider what variables to include.
+
+```{r}
+#| fig-height: 7
+#| warning: false
+# check out their correlation:
+correl <- cor(simPts[, names(envStack)], method = "spearman")
+# print(correl, digits = 2)
+ggcorrplot(correl)
+```
+
+Somewhat arbitrarily, let's use variables 6, 15, and 8 (Min.Temperature.of.Coldest.Month, Precipitation.Seasonality, and Mean.Temperature.of.Wettest.Quarter). The coefficients of the linear function are somewhat arbitrary as well ('hand-tuned'). Note that we're scaling the input variables as we compute this, so that every variable is on a comparable scale.
+
+```{r}
+#| fig-height: 6
+logistic <- function(x) { 1 / (1 + exp(-x)) }
+# parameters
+intercept <- -1.5
+beta1 <- -1.5
+beta2 <- -1.5
+beta3 <- 1.5
+pOcc <- logistic(intercept +
+                   beta1 * scale(envStack$Precipitation.Seasonality) +
+                   beta2 * scale(envStack$Min.Temperature.of.Coldest.Month) +
+                   beta3 * scale(envStack$Mean.Temperature.of.Wettest.Quarter))
+names(pOcc) <- "pOcc"
+
+# plot the three relevant climate variables and the probability of occurrence
+plot(c(envStack$Precipitation.Seasonality,
+       envStack$Min.Temperature.of.Coldest.Month,
+       envStack$Mean.Temperature.of.Wettest.Quarter,
+       pOcc),
+     main = c("Precipitation.Seasonality", "Min.Temperature.of.Coldest.Month",
+              "Mean.Temperature.of.Wettest.Quarter", "Probability of Occurrence"))
+```
+
+Next, we use `rbinom()` to "flip a coin" with probability of heads corresponding to the value of the pOcc surface at the sampling points. Points with a high pOcc (e.g., 0.9) will be more likely (but not certain) to be heads (present). Points with a low pOcc (e.g., 0.2) will be more likely (but not certain) to be tails (absent).
+
+```{r}
+# get the values that correspond to the points we selected:
+probs <- extract(pOcc, simPts[, c("x", "y")], ID = FALSE)$pOcc
+
+# sample from these probabilities (note the *different* seed -- see below):
+set.seed(5678)
+obs <- rbinom(n = nPoints, size = 1, prob = probs)
+# put response and variables together in a data.frame:
+modelingDF <- cbind(PresAbs = obs, simPts)
+
+p <- ggplot(data = modelingDF,
+            mapping = aes(x = x, y = y, color = factor(PresAbs))) +
+  geom_point() +
+  coord_quickmap() +
+  labs(color = "PresAbs")
+p
+```
+
+::: {.callout-warning collapse="true" title="Why a different seed for rbinom()?"}
+Re-seeding before each random step makes chunks reproducible even if you run them out of order, but **don't reuse the same seed for different steps**. `set.seed(1234)` replays the same stream of random numbers every time. `spatSample()` used that stream to choose cell numbers, which run from north to south. If `rbinom()` reused it, the same numbers would decide presence vs. absence, so "present" would become correlated with latitude and the fitted coefficients would be biased. Try it: change the seed above back to 1234 and refit `model1`.
+:::
+
+Now, supposing we had only been given these data, we could imagine fitting a model to them. Let's start with logistic regression.
+
+```{r}
+model1 <- glm(formula = PresAbs ~ Precipitation.Seasonality +
+                Min.Temperature.of.Coldest.Month +
+                Mean.Temperature.of.Wettest.Quarter,
+              data = modelingDF,
+              family = "binomial")
+summary(model1)
+```
+
+Notice that our parameter estimates are close to the true values we used to simulate the data, as you might expect.
+
+::: {.callout-tip title="Question"}
+Under what conditions would you NOT expect the parameter estimates to be close to the true values?
+:::
+
+Of course, we might not know the correct variables in advance!
+
+::: {.callout-tip title="Question"}
+What happens if you omit one of the variables we used? What happens if you add some variables that we didn't use?
+:::
+
+Here are some more concrete models for you to check out as you answer these questions:
+
+```{r}
+model2 <- glm(formula = PresAbs ~ Precipitation.Seasonality +
+                Mean.Temperature.of.Coldest.Quarter +
+                Mean.Temperature.of.Wettest.Quarter,
+              data = modelingDF,
+              family = "binomial")
+
+model3 <- glm(formula = PresAbs ~ Precipitation.Seasonality +
+                Temperature.Seasonality +
+                Mean.Temperature.of.Wettest.Quarter,
+              data = modelingDF,
+              family = "binomial")
+
+model4 <- glm(formula = PresAbs ~ Precipitation.Seasonality +
+                Min.Temperature.of.Coldest.Month +
+                Mean.Temperature.of.Wettest.Quarter +
+                Mean.Diurnal.Range,
+              data = modelingDF,
+              family = "binomial")
+```
+
+In addition to looking at the estimated parameters, we can look at the predicted maps from these models. terra's `predict()` applies a fitted model to every cell of the raster stack.
+
+```{r}
+#| fig-height: 6
+pred1 <- predict(envStack, model1, type = "response")
+pred2 <- predict(envStack, model2, type = "response")
+pred3 <- predict(envStack, model3, type = "response")
+pred4 <- predict(envStack, model4, type = "response")
+
+plot(c(pOcc, pred1, pred2, pred3, pred4),
+     main = c("Truth", "Model1", "Model2", "Model3", "Model4"),
+     range = c(0, 1), nc = 3)
+```
+
+::: {.callout-important title="Exercise"}
+Create your own simulated species by modifying the code above in some way. If you need inspiration, perhaps consider a species you are interested in. You could change the important variables, the parameter values, the sampling procedure, the type of data that is created (e.g., abundance instead of presence/absence)... Have fun!
+:::
+
+# Turn in
+
+**(a Canvas discussion post, by the due date on Canvas)** Please post to the online discussion of this lab. Please include a brief description of your simulated species (what aspects of the process you explored), along with plots and any comments you have about the exercise. Please also include, if applicable:
+
+* Any key take-aways from this lab that you want to remember for any future projects you may conduct in which you use species distribution models.
+* Any remaining questions or confusions do you have that you might like to learn more about.

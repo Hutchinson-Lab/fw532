@@ -1,0 +1,143 @@
+---
+title: "Lab 3: Classification and Regression Trees (CART)"
+subtitle: "Split the data, then split again: a model you can read"
+description: "Fit classification trees to a virtual species with nonlinear and interactive responses, map what each split means, and see how tree complexity, pruning, and resampling change the story."
+image: images/lab03.png
+order: 3
+---
+
+::: {.lab-meta}
+[Weeks 2–3]{} [Intro to trees (no assigned reading)]{} [Methods: classification trees, pruning, cross-validation]{} [R · Python]{}
+:::
+
+## Why this lab?
+
+Species rarely respond to the environment in straight lines. A plant may need winters that are cold enough *and* summers that are wet enough, and the effect of one variable can depend on the level of another. A logistic regression only captures curves and interactions you write into the formula yourself. A classification tree finds them from the data.
+
+Trees are also the building block for several of the most widely used SDM methods: random forests (Lab 4) and boosted regression trees (Lab 5) are both collections of many trees. If you understand how one tree is grown, pruned, and read, those ensembles stop being black boxes.
+
+In this lab you simulate a species with a quadratic response and an interaction, fit trees to it, and trace what individual splits and leaves mean in environmental space and on the map. Then you change the tree's complexity and refit it to bootstrap samples, which shows the main weakness of single trees: they are unstable.
+
+## Key concepts
+
+### Recursive binary partitioning
+
+A tree is built by asking one yes/no question at a time. At the root, the algorithm considers every variable and every possible split point, and picks the single question (e.g., "is Mean.Temperature.of.Wettest.Quarter < 15.8 °C?") that best separates presences from absences. That splits the data into two groups. It then repeats the same search *within* each group, and so on, until a stopping rule says to stop. Each final group is a **leaf**, and the tree predicts the same value for everything in a leaf: the proportion of presences among the training points there (or the majority class).
+
+```{mermaid}
+%%| fig-width: 6.5
+flowchart TD
+  A["All sites<br/>temperature &lt; t₁ ?"] -- yes --> B["diurnal range &lt; d₁ ?"]
+  A -- no --> C["Leaf: mostly presences<br/>predict 1"]
+  B -- yes --> D["Leaf: mostly absences<br/>predict 0"]
+  B -- no --> E["Leaf: mostly presences<br/>predict 1"]
+```
+
+The search is *greedy*: each split is the best one available at that moment, with no look-ahead. That keeps fitting fast but means the tree as a whole is not guaranteed to be the best possible tree.
+
+### Impurity: how a split is chosen
+
+A good split produces child nodes that are each "purer" (closer to all presences or all absences) than the parent. For a node where a proportion $p$ of the training points are presences, two common impurity measures are
+
+$$
+\text{Gini} = 1 - \sum_k p_k^2 = 2p(1-p),
+\qquad
+\text{Entropy} = -\sum_k p_k \log p_k .
+$$
+
+Both are 0 for a pure node and largest when $p = 0.5$. A candidate split sends $n_L$ of the node's $n$ points left and $n_R$ right, and its **gain** is the drop in impurity, weighting each child by its size:
+
+$$
+\Delta = I(\text{parent}) - \frac{n_L}{n} I(\text{left}) - \frac{n_R}{n} I(\text{right}).
+$$
+
+The tree takes the variable and split point with the largest gain. rpart and scikit-learn both use the Gini index by default. For a continuous variable, only split points between consecutive observed values matter, so the search is finite. For regression trees (e.g., abundance), the impurity is the within-node sum of squared errors (rpart's `method = "anova"`).
+
+### Leaves are rectangles in environmental space, not on the map
+
+Every leaf is defined by the conditions on the path from the root down to it, such as "temperature < 15.8 **and** diurnal range ≥ 5.9 **and** diurnal range < 13.8". In environmental space, that is a box (a rectangle with sides parallel to the axes). On the map, the same box can be a scattered, irregular region: every cell whose climate falls inside it, wherever it is. The lab maps the region for the root split and for one leaf so you can see this directly.
+
+::: {.concept}
+**Interactions come from paths.** If a leaf's path uses two different variables, the effect of one depends on the value of the other: a 2-way interaction, found without writing an interaction term. Splitting the same variable more than once along a path builds a nonlinear (step-shaped) response, such as the quadratic effect in this lab's virtual species.
+:::
+
+### Complexity control and pruning
+
+Left alone, a tree keeps splitting until its leaves are tiny and nearly pure. It then fits the training data very well and new data poorly. Tree size is controlled in two ways:
+
+* **Stopping rules** limit growth: a minimum node size to attempt a split, a minimum leaf size, and a maximum depth.
+* **Pruning** grows a large tree and cuts back branches that don't earn their keep. *Cost-complexity pruning* (Breiman et al. 1984) penalizes each extra leaf. rpart writes it as $R_{cp}(T) = R(T) + cp \cdot |T| \cdot R(T_1)$, where $R(T)$ is the tree's training error, $|T|$ its size, and $R(T_1)$ the error of the tree with no splits. Bigger `cp` means smaller trees.
+
+| Control | rpart (`rpart.control`) | scikit-learn (`DecisionTreeClassifier`) |
+|---|---|---|
+| Smallest node to split | `minsplit = 20` | `min_samples_split = 2` |
+| Smallest leaf | `minbucket = round(minsplit/3)` | `min_samples_leaf = 1` |
+| Maximum depth (root = 0) | `maxdepth = 30` | `max_depth = None` (no limit) |
+| Cost-complexity pruning | `cp = 0.01` (relative to the root's error) | `ccp_alpha = 0` (absolute, in Gini units; no pruning) |
+| Internal cross-validation | `xval = 10` folds | none (use `cross_val_score`) |
+
+The values shown are the defaults, and they differ a lot: by default rpart prunes and scikit-learn doesn't, so the two packages give very different trees from the same data unless you set them up alike. Even then they won't match exactly. They measure the fit used for pruning differently (rpart uses the misclassification rate, scikit-learn uses Gini impurity), and the Python and R labs simulate different random data.
+
+How do you choose `cp`? **Cross-validation.** rpart automatically computes a 10-fold cross-validated error (`xerror`) for every candidate `cp` and stores it in the model's cp table (`printcp()`, `plotcp()`), but it does *not* use it to choose the tree for you. You pick a `cp`, commonly the one with the lowest `xerror` or the simplest tree within one standard error of it (the "1-SE rule"), and call `prune()`. The Python lab does the same thing by hand with `cost_complexity_pruning_path()` and `cross_val_score()`.
+
+### Strengths and weaknesses
+
+| Strengths | Weaknesses |
+|---|---|
+| Easy to read and explain: a tree is a set of if–then rules | **High variance:** small changes to the data can change the splits, and with them the whole "story" |
+| Finds nonlinear responses and interactions automatically | Predictions are step functions, with abrupt jumps at split points |
+| No need to scale or transform predictors: any monotone transformation gives the same splits | Greedy search: an early poor split can't be undone later |
+| Handles continuous and categorical predictors, and (in rpart) missing values through *surrogate* splits | A single tree usually predicts less accurately than an ensemble of trees |
+
+rpart's variable importance adds up each variable's contribution as the primary split *and* as a surrogate, so a variable can score as important without appearing in the tree. scikit-learn's `feature_importances_` (Gini importance) counts only the splits actually used.
+
+The instability shows up clearly in the exercise, where you refit the same tree to bootstrap samples of the training data. Averaging many trees fit to bootstrap samples (**bagging**), and also randomizing which variables each split may use (**random forests**), turns that weakness into a strength. That is the topic of Lab 4.
+
+## What you'll do
+
+1. Simulate a virtual species with a quadratic response to diurnal temperature range and an interaction between isothermality and temperature.
+2. Fit a classification tree to three relevant variables and read its splits.
+3. Compare presences and absences along the root split, then map the regions that correspond to the root split and to the leftmost leaf.
+4. Evaluate the tree with AUC on training and test data.
+5. Change the complexity controls, grow an unpruned tree, and prune it using cross-validation.
+6. Fit a tree to 12 climate variables and compare variable importance.
+7. **Exercise:** refit the tree to bootstrap samples and compare the trees, their AUCs, and variable importance.
+
+## Get the starter code
+
+Both versions do the same analysis step by step. Pick the language you're learning (or try both!). New to the course? Start with [Get set up](../setup.qmd).
+
+::: {.starter-code}
+::: {.track}
+#### R
+
+[Read the R lab](../r/lab03-cart.qmd){.btn .btn-primary}
+[R starter kit (.zip)](../downloads/fw532-R-labs.zip){.btn .btn-outline-primary}
+
+In the kit, open `fw532.Rproj`, then `r/lab03-cart.qmd`. Uses **terra**, **rpart**, **rpart.plot**, and **pROC**.
+:::
+
+::: {.track .python}
+#### Python
+
+[Read the Python lab](../python/lab03-cart.qmd){.btn .btn-primary}
+[Open in Colab](https://colab.research.google.com/github/Hutchinson-Lab/fw532/blob/main/python/lab03-cart.ipynb){.btn .btn-outline-primary}
+[Python starter kit (.zip)](../downloads/fw532-python-labs.zip){.btn .btn-outline-primary}
+
+Open `python/lab03-cart.ipynb`. Uses **numpy**, **pandas**, **matplotlib**, and **scikit-learn**.
+:::
+:::
+
+## Turn in
+
+Post to the Canvas discussion for this lab by the due date on Canvas. Include brief descriptions of your exploration of the exercise, with any relevant plots. If applicable, also include:
+
+* key take-aways you'd want to remember for a future SDM project, and
+* remaining questions or confusions you'd like to learn more about.
+
+## Readings & resources
+
+* Therneau, T. M., & Atkinson, E. J. An introduction to recursive partitioning using the RPART routines. Vignette for the R package rpart. <https://cran.r-project.org/web/packages/rpart/vignettes/longintro.pdf>
+* Breiman, L., Friedman, J. H., Olshen, R. A., & Stone, C. J. (1984). *Classification and Regression Trees*. Wadsworth.
+* Elith, J., Leathwick, J. R., & Hastie, T. (2008). A working guide to boosted regression trees. *Journal of Animal Ecology*, 77(4), 802–813. <https://doi.org/10.1111/j.1365-2656.2008.01390.x> (its introduction summarizes the strengths and weaknesses of single trees in an SDM context)
+* scikit-learn user guide, Decision trees: <https://scikit-learn.org/stable/modules/tree.html>

@@ -1,0 +1,152 @@
+---
+title: "Lab 5: Boosted Regression Trees (BRT)"
+subtitle: "Many small trees, each fixing what the last ones missed"
+description: "Fit boosted regression trees to a nonlinear virtual species, choose the number of trees by cross-validation, interpret the model with relative influence and partial dependence, and compare it with a random forest."
+image: images/lab05.png
+order: 5
+---
+
+::: {.lab-meta}
+[Week 4]{} [Readings: Elith, Leathwick & Hastie (2008); Breiman (2001)]{} [Methods: boosted regression trees, cross-validation]{} [R · Python]{}
+:::
+
+## Why this lab?
+
+Boosted regression trees (BRT, also called gradient boosting machines) are one of the most widely used and best-performing methods for species distribution modeling. Like random forests, they combine many trees, so they fit nonlinear responses and interactions without being told about them. But they build the ensemble in a different way. Each new tree is small and is fit to whatever the current model still gets wrong.
+
+That power comes with settings that interact: the learning rate, the tree complexity, and the number of trees. Set them carelessly and a BRT overfits or underfits. Elith, Leathwick & Hastie (2008) wrote their "working guide" to give ecologists practical rules for these choices and tools for interpreting the fitted model, and the dismo tutorial that accompanies it is the core of this lab.
+
+We fit BRTs to the same nonlinear virtual species as in the random forest lab, with a quadratic effect and an interaction built in. Because we know the truth, we can check whether the model's variable importances, response curves, and interactions recover it, and we can compare BRTs and random forests on equal footing.
+
+## Key concepts
+
+### Boosting: a forward, stagewise additive model
+
+A BRT model for presence/absence is a logistic regression in which the linear predictor is replaced by a sum of trees:
+
+$$
+\text{logit}\,\hat\psi(x) = f_0 + \nu \sum_{m=1}^{M} T_m(x),
+$$
+
+where $f_0$ is a constant (the log-odds of overall prevalence), each $T_m$ is a small regression tree, $\nu$ is the learning rate, and $M$ is the number of trees. The trees are added one at a time:
+
+1. Start with $f_0$.
+2. Compute, for every training point, the direction that would most reduce the deviance. For the binomial deviance this is simply the residual $y_i - \hat\psi_i$.
+3. Fit a small tree to those residuals, shrink its contribution by $\nu$, and add it to the model.
+4. Repeat from step 2.
+
+This is "functional gradient descent" (Friedman 2001): each tree takes a small step downhill on the deviance. It is **stagewise**, not stepwise: earlier trees are never refit, only new ones are added. Early trees capture the strongest patterns. Later trees concentrate on the points the model still predicts poorly.
+
+::: {.concept}
+**Analogy with logistic regression.** Fitting a GLM by gradient ascent repeatedly nudges a few coefficients in the direction that increases the log-likelihood. Boosting does the same thing, but each "nudge" is a whole tree, so the fitted function is not restricted to a straight line on the logit scale.
+:::
+
+### The three settings and their trade-offs
+
+| Setting | gbm / dismo name | What it controls | Elith et al.'s guidance |
+|---|---|---|---|
+| Learning rate | `learning.rate` (lr) | How much each tree contributes | Smaller is generally better but needs more trees. Aim for at least 1,000 trees. |
+| Tree complexity | `tree.complexity` (tc) | Number of splits per tree, so the highest order of interaction the model can fit | tc = 1 (stumps) gives an additive model; tc = 2 allows two-way interactions, and so on. Best set with independent data or CV. |
+| Number of trees | `n.trees` (nt) | How long the model keeps learning | Too few underfits; too many overfits. Choose by cross-validation. |
+
+These settings work together. With a smaller learning rate, more trees are needed to reach the same fit, and the cross-validated estimate of the best number of trees becomes more reliable. Larger trees learn faster, so as tc goes up, lr usually has to come down (Elith et al. suggest roughly halving lr when tc doubles). The constraint in practice is computing time.
+
+### Stochastic boosting: the bag fraction
+
+Friedman (2002) found that fitting each tree to a random subsample of the data, drawn without replacement, usually improves accuracy and reduces overfitting. The **bag fraction** is that proportion. Elith et al. found 0.5–0.75 worked well for presence/absence data. Because of this randomness, two runs give slightly different models unless you set a seed.
+
+### Choosing the number of trees by cross-validation
+
+Boosting will keep reducing the training deviance until the data are badly overfit, so the number of trees has to be chosen on held-out data. dismo's `gbm.step()` does this with 10-fold cross-validation:
+
+```{mermaid}
+%%| fig-width: 7
+flowchart LR
+  A["Split training data<br/>into 10 folds"] --> B["Fit to 9 folds,<br/>adding trees in steps"]
+  B --> C["Deviance on the<br/>held-out fold"]
+  C --> D["Average over folds:<br/>CV deviance vs. trees"]
+  D --> E["Pick the number<br/>of trees at the minimum"]
+  E --> F["Refit to all<br/>training data"]
+```
+
+The CV curve also gives honest estimates of predictive deviance and AUC. The Python version of the lab builds a small `gbm_step()` function that does the same thing with scikit-learn.
+
+### Interpreting a model with thousands of trees
+
+A BRT isn't a black box. Three tools summarize it:
+
+* **Relative influence**: how often each variable is used for splitting, weighted by how much those splits improve the model, averaged over trees and scaled to sum to 100.
+* **Partial dependence plots**: the fitted effect of one variable after accounting for the average effects of the others, usually on the logit scale. They can mislead when predictors are strongly correlated or interactions are strong.
+* **Interaction measures**: for each pair of variables, how far the model's predictions over a grid of the pair depart from an additive pattern. Strong pairs can be drawn as 3-D surfaces.
+
+With a simulated species you can check all of these against the truth. Correlated climate variables make this harder than it sounds.
+
+### BRT vs. random forests
+
+Both are ensembles of trees, but they reduce error in different ways:
+
+| | Random forest | Boosted regression trees |
+|---|---|---|
+| How trees are built | Independently, in parallel | Sequentially; each corrects the previous ones |
+| Size of each tree | Large, deep trees | Small trees (a few splits) |
+| Randomness | Bootstrap samples + random subset of variables at each split | Random subsample (bag fraction) for each tree |
+| Main effect on error | Averages away **variance** of deep, low-bias trees | Reduces **bias** step by step, with shrinkage and CV to control variance |
+| Sensitivity to settings | Fairly robust to defaults | Needs tuning of lr, tc, and nt |
+
+A fair comparison needs both models tuned well: a "peak-to-peak" comparison, as the lab's second exercise asks.
+
+### Two cultures
+
+Breiman (2001) described two cultures of statistical modeling. In the **data modeling** culture, the analyst assumes a stochastic model for how the data were generated (for example, a logistic regression with chosen terms) and draws conclusions from its parameters. In the **algorithmic modeling** culture, the data-generating mechanism is treated as unknown and complex, and models are judged by how well they predict new data. Elith et al. (2008) place BRT between the two: it comes from machine learning, but statisticians later reinterpreted boosting as an advanced form of regression.
+
+For SDMs, the framing raises useful questions. A GLM's coefficients are only as trustworthy as its assumed form, and Lab 1 showed how a misspecified model can mislead. A BRT doesn't need the form specified in advance, but its interpretation rests on summaries such as relative influence and partial dependence, and those can mislead too. Breiman also notes that many different models can predict about equally well (the "Rashomon" effect), so a good predictive score doesn't by itself show that a model's explanation is right. Simulated species let us test both prediction and explanation.
+
+## What you'll do
+
+1. Simulate the nonlinear virtual species and sample 1,000 points, keeping points with missing elevation (BRTs in R can handle missing values).
+2. Work through the dismo BRT tutorial on these data, starting from a provided scaffold.
+3. Fit a model with `gbm.step()` (R) or `gbm_step()` (Python) and inspect the cross-validation curve.
+4. Look at relative influence, partial dependence plots, and the strongest interaction.
+5. Evaluate on the test set (deviance and AUC) and predict a map.
+6. **Exercises:** explore an aspect of BRTs of your choice, and compare a well-tuned BRT with a well-tuned random forest.
+
+## Get the starter code
+
+Both versions do the same analysis step by step. Pick the language you're learning (or try both!). New to the course? Start with [Get set up](../setup.qmd).
+
+::: {.starter-code}
+::: {.track}
+#### R
+
+[Read the R lab](../r/lab05-brt.qmd){.btn .btn-primary}
+[R starter kit (.zip)](../downloads/fw532-R-labs.zip){.btn .btn-outline-primary}
+
+In the kit, open `fw532.Rproj`, then `r/lab05-brt.qmd`. Uses **terra**, **dismo**, **gbm**, and **pROC**, alongside the [dismo BRT tutorial](https://rspatial.org/raster/sdm/9_sdm_brt.html).
+:::
+
+::: {.track .python}
+#### Python
+
+[Read the Python lab](../python/lab05-brt.qmd){.btn .btn-primary}
+[Open in Colab](https://colab.research.google.com/github/Hutchinson-Lab/fw532/blob/main/python/lab05-brt.ipynb){.btn .btn-outline-primary}
+[Python starter kit (.zip)](../downloads/fw532-python-labs.zip){.btn .btn-outline-primary}
+
+Open `python/lab05-brt.ipynb`. Uses **numpy**, **pandas**, **matplotlib**, and **scikit-learn** (`GradientBoostingClassifier`).
+:::
+:::
+
+## Turn in
+
+Post to the Canvas discussion for this lab by the due date on Canvas. Include brief descriptions of your exploration of the exercises, with any relevant plots. If applicable, also include:
+
+* key take-aways you'd want to remember for a future SDM project, and
+* remaining questions or confusions you'd like to learn more about.
+
+## Readings & resources
+
+* Elith, J., Leathwick, J. R., & Hastie, T. (2008). A working guide to boosted regression trees. *Journal of Animal Ecology*, 77(4), 802–813. <https://doi.org/10.1111/j.1365-2656.2008.01390.x> (Appendix S3 in the Supporting Information has the original tutorial, code, and data.)
+* Breiman, L. (2001). Statistical modeling: The two cultures. *Statistical Science*, 16(3), 199–231. <https://doi.org/10.1214/ss/1009213726>
+* Elith, J., & Leathwick, J. R. Boosted regression trees for ecological modeling (dismo tutorial): <https://rspatial.org/raster/sdm/9_sdm_brt.html>
+* Ridgeway, G. Generalized Boosted Models: A guide to the gbm package: <https://cran.r-project.org/web/packages/gbm/vignettes/gbm.html>
+* Friedman, J. H. (2001). Greedy function approximation: A gradient boosting machine. *Annals of Statistics*, 29(5), 1189–1232. <https://doi.org/10.1214/aos/1013203451>
+* Friedman, J. H. (2002). Stochastic gradient boosting. *Computational Statistics & Data Analysis*, 38(4), 367–378. <https://doi.org/10.1016/S0167-9473(01)00065-2>

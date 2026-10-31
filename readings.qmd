@@ -1,0 +1,64 @@
+---
+title: "Readings"
+subtitle: "Papers we discuss, in course order"
+---
+
+There is usually one paper per class meeting. Discussion posts are due on Canvas before class. PDFs are on Canvas; the links below go to the publisher's page.
+
+## Foundations
+
+**Week 0 · Intro to SDMs**
+Elith, J., & Leathwick, J. R. (2009). Species distribution models: Ecological explanation and prediction across space and time. *Annual Review of Ecology, Evolution, and Systematics*, 40, 677–697. <https://doi.org/10.1146/annurev.ecolsys.110308.120159>
+
+**Week 1 · Types of data** · [Lab 1](labs/01-simulation.qmd)
+Guillera-Arroita, G., Lahoz-Monfort, J. J., Elith, J., Gordon, A., Kujala, H., Lentini, P. E., McCarthy, M. A., Tingley, R., & Wintle, B. A. (2015). Is my species distribution model fit for purpose? Matching data and models to applications. *Global Ecology and Biogeography*, 24(3), 276–292. <https://doi.org/10.1111/geb.12268>
+
+## Evaluation
+
+**Week 2 · Evaluation metrics** · [Lab 2](labs/02-evaluation.qmd)
+Liu, C., White, M., & Newell, G. (2011). Measuring and comparing the accuracy of species distribution models with presence–absence data. *Ecography*, 34(2), 232–243. <https://doi.org/10.1111/j.1600-0587.2010.06354.x>
+
+**Week 2 · Cross-validation** · [Lab 2](labs/02-evaluation.qmd)
+Roberts, D. R., Bahn, V., Ciuti, S., Boyce, M. S., Elith, J., Guillera-Arroita, G., et al. (2017). Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure. *Ecography*, 40(8), 913–929. <https://doi.org/10.1111/ecog.02881>
+
+## Tree-based methods
+
+**Week 3 · Random forests** · [Labs 3–4](labs/03-cart.qmd)
+Cutler, D. R., Edwards, T. C., Beard, K. H., Cutler, A., Hess, K. T., Gibson, J., & Lawler, J. J. (2007). Random forests for classification in ecology. *Ecology*, 88(11), 2783–2792. <https://doi.org/10.1890/07-0539.1>
+
+**Week 3 · Random forests for presence-only data** · [Lab 4](labs/04-random-forests.qmd)
+Valavi, R., Elith, J., Lahoz-Monfort, J. J., & Guillera-Arroita, G. (2021). Modelling species presence-only data with random forests. *Ecography*, 44(12), 1731–1742. <https://doi.org/10.1111/ecog.05615>
+
+**Week 4 · Algorithmic paradigms**
+Breiman, L. (2001). Statistical modeling: The two cultures (with comments and a rejoinder by the author). *Statistical Science*, 16(3), 199–231. <https://doi.org/10.1214/ss/1009213726>
+
+**Week 4 · Boosted regression trees** · [Lab 5](labs/05-brt.qmd)
+Elith, J., Leathwick, J. R., & Hastie, T. (2008). A working guide to boosted regression trees. *Journal of Animal Ecology*, 77(4), 802–813. <https://doi.org/10.1111/j.1365-2656.2008.01390.x>
+
+## Comparing methods & presence-only modeling
+
+**Week 6 · Model comparison** · [Bake-off demo](labs/demos.qmd)
+Valavi, R., Guillera-Arroita, G., Lahoz-Monfort, J. J., & Elith, J. (2022). Predictive performance of presence-only species distribution models: A benchmark study with reproducible code. *Ecological Monographs*, 92(1), e01486. <https://doi.org/10.1002/ecm.1486>
+
+**Week 6 · Point process models** · [Point-process demo](labs/demos.qmd)
+Renner, I. W., Elith, J., Baddeley, A., Fithian, W., Hastie, T., Phillips, S. J., Popovic, G., & Warton, D. I. (2015). Point process models for presence-only analysis. *Methods in Ecology and Evolution*, 6(4), 366–379. <https://doi.org/10.1111/2041-210X.12352>
+
+**Week 7 · Maxent** · [Lab 6](labs/06-maxent.qmd)
+Elith, J., Phillips, S. J., Hastie, T., Dudík, M., Chee, Y. E., & Yates, C. J. (2011). A statistical explanation of MaxEnt for ecologists. *Diversity and Distributions*, 17(1), 43–57. <https://doi.org/10.1111/j.1472-4642.2010.00725.x>
+
+## Further topics
+
+**Week 8 · Graph neural networks** · [Bonus lab](labs/07-neural-networks.qmd)
+Harrell, L., Kaeser-Chen, C., Karagol Ayan, B., Anderson, K., Conserva, M., Kleeman, E., Neumann, M., Overlan, M., Chapman, M., & Purves, D. (2025). Heterogenous graph neural networks for species distribution modeling. *Tackling Climate Change with Machine Learning workshop, ICLR 2025*. <https://arxiv.org/abs/2503.11900>
+
+**Week 9 · Paintings predict species?**
+Fourcade, Y., Besnard, A. G., & Secondi, J. (2018). Paintings predict the distribution of species, or the challenge of selecting environmental predictors and evaluation statistics. *Global Ecology and Biogeography*, 27(2), 245–256. <https://doi.org/10.1111/geb.12684>
+
+**Week 9 · Climate change and Pokémon?**
+Warren, D. L., Dornburg, A., Zapfe, K., & Iglesias, T. L. (2021). The effects of climate change on Australia's only endemic Pokémon: Measuring bias in species distribution models. *Methods in Ecology and Evolution*, 12(6), 985–995. <https://doi.org/10.1111/2041-210X.13591>
+
+## Software references
+
+* `terra` (rasters in R): <https://rspatial.org/>
+* `scikit-learn` user guide (Python ML): <https://scikit-learn.org/stable/user_guide.html>
+* Maxent software and tutorial: <https://biodiversityinformatics.amnh.org/open_source/maxent/>

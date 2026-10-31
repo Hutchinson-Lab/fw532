@@ -1,0 +1,34 @@
+<!-- Adds "Open in Colab / starter kit / overview" buttons to the top of every R and Python lab page. -->
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var m = window.location.pathname.match(/\/(r|python)\/([^\/]+)\.html$/);
+  var header = document.getElementById("title-block-header");
+  if (!m || !header) return;
+  var lang = m[1], name = m[2];
+  var repo = "https://github.com/Hutchinson-Lab/fw532";
+  var file = name + (lang === "r" ? ".qmd" : ".ipynb");
+  var lab = name.match(/^lab(\d\d)-(.+)$/);
+  var overview = lab ? "../labs/" + lab[1] + "-" + lab[2] + ".html" : "../labs/demos.html";
+
+  var links = [];
+  if (lang === "python") {
+    links.push(["Open in Colab", "https://colab.research.google.com/github/Hutchinson-Lab/fw532/blob/main/python/" + file, "btn-primary"]);
+  }
+  links.push([lang === "r" ? "R starter kit (.zip)" : "Python starter kit (.zip)",
+              "../downloads/fw532-" + (lang === "r" ? "R" : "python") + "-labs.zip", "btn-outline-primary"]);
+  links.push([lab ? "Lab overview" : "All demos", overview, "btn-outline-secondary"]);
+  links.push([file + " on GitHub", repo + "/blob/main/" + lang + "/" + file, "btn-outline-secondary"]);
+
+  var bar = document.createElement("div");
+  bar.className = "notebook-links";
+  links.forEach(function (l) {
+    var a = document.createElement("a");
+    a.textContent = l[0];
+    a.href = l[1];
+    a.className = "btn btn-sm " + l[2];
+    if (/^https?:/.test(l[1])) { a.target = "_blank"; a.rel = "noopener"; }
+    bar.appendChild(a);
+  });
+  header.appendChild(bar);
+});
+</script>

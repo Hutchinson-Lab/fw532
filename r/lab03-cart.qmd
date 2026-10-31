@@ -1,0 +1,328 @@
+---
+title: "Lab 3: Classification and Regression Trees (CART)"
+subtitle: "FW 532 · R version"
+---
+
+**Goals:** To understand how classification and regression trees are built and interpreted in R.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* R packages: terra, rpart, rpart.plot, pROC, here (run `source("install_packages.R")` once to install everything for the term)
+
+# Setup
+
+```{r}
+#| message: false
+#| warning: false
+library(terra)      # rasters (gridded maps)
+library(rpart)      # classification and regression trees
+library(rpart.plot) # clearer tree plots
+library(pROC)       # ROC curves and AUC
+library(here)       # file paths relative to the project folder
+
+envStack <- rast(here("data", "envStack.tif"))
+```
+
+# Simulate Data
+
+We will use simulated data again in the exercises below. Since trees can handle nonlinearities and interactions, let's use a more complex species simulation this week. Note that we don't need to scale the environmental variables for modeling, as it doesn't matter to rpart. We'll still scale them to generate the species, since there we're setting up a (non)linear equation and it's easier to think about the coefficients when the variables are scaled.
+
+```{r}
+# define logistic function
+logistic <- function(x) { exp(x) / (1 + exp(x)) }
+
+# get points
+nPoints <- 1000
+set.seed(1234)
+simPts <- spatSample(envStack, size = nPoints, method = "random",
+                     na.rm = TRUE, xy = TRUE)
+
+# set parameters
+#intercept = -1.5
+#beta1 = -2
+#beta2 = -1.5
+#beta3 = 1.5
+#pOccRaster = logistic(intercept +
+#                  beta1 * scale(envStack$Precipitation.Seasonality) +
+#                  beta2 * scale(envStack$Min.Temperature.of.Coldest.Month) +
+#                  beta3 * scale(envStack$Mean.Temperature.of.Wettest.Quarter))
+
+intercept <- -0.25
+beta1 <- -1
+beta2 <- 1
+beta3 <- 1.5
+beta4 <- 1
+beta5 <- -1
+pOccRaster <- logistic(intercept +
+                         beta1 * scale(envStack$Mean.Diurnal.Range) +
+                         beta2 * scale(envStack$Isothermality) +
+                         beta3 * scale(envStack$Mean.Temperature.of.Wettest.Quarter) +
+                         beta4 * scale(envStack$Mean.Diurnal.Range)^2 + # quadratic term
+                         beta5 * scale(envStack$Isothermality) * scale(envStack$Mean.Temperature.of.Wettest.Quarter)) # interaction term
+names(pOccRaster) <- "pOcc"
+
+# get the values that correspond to the points we selected:
+pOccs <- extract(pOccRaster, simPts[, c("x", "y")], ID = FALSE)$pOcc
+
+# sample from these probabilities (a *different* seed for a different random step; see Lab 1):
+set.seed(5678)
+presAbs <- rbinom(n = nPoints, size = 1, prob = pOccs)
+
+# put response and variables together in a data.frame:
+modelingDF <- cbind(presAbs, simPts)
+
+# plot the result
+plot(pOccRaster)
+points(modelingDF$x[modelingDF$presAbs == 0], modelingDF$y[modelingDF$presAbs == 0],
+       col = "blue", pch = 20)
+points(modelingDF$x[modelingDF$presAbs == 1], modelingDF$y[modelingDF$presAbs == 1],
+       col = "red", pch = 20)
+legend("left", c("detection", "non-detection"), col = c("red", "blue"), pch = c(20, 20))
+
+# split into training and test
+trainData <- modelingDF[1:(nPoints/2), ]
+testData <- modelingDF[(nPoints/2 + 1):nPoints, ]
+```
+
+(The sampled points come back in random order, so taking the first half for training and the second half for testing is a random split.)
+
+# Classification Trees
+
+Let's assume we either have some prior knowledge of the species or have done some exploratory modeling to select good variables. Here, we'll fit and plot a basic classification tree with only the relevant variables. In the plot from `rpart.plot()`, each box shows the predicted class (0 or 1) and the numbers of training absences and presences that reached that node (like `use.n = TRUE` in rpart's own `text()`). Points that meet a node's condition go left.
+
+```{r}
+#| fig-height: 6
+mod1 <- rpart(presAbs ~ Mean.Diurnal.Range + Isothermality + Mean.Temperature.of.Wettest.Quarter,
+              data = trainData,
+              method = "class")
+rpart.plot(mod1, extra = 1, box.palette = "BuRd", digits = 4) # 4 significant digits, like print(mod1) below
+```
+
+Let's take a closer look at the splits in the tree. `print(mod1)` lists every node with its number, its split, and how many training points reached it. We can also pull the root's split out of the model directly:
+
+```{r}
+print(mod1)
+
+# the variable and the split value used at the root (node 1):
+rootVar <- as.character(mod1$frame$var[1])
+rootValue <- mod1$splits[1, "index"]  # the first row of mod1$splits is the root's split
+rootVar
+rootValue
+```
+
+At the root, we split on `r rootVar`, at the value `r round(rootValue, 2)`. This partitions the data into two chunks. First let's see the split in environmental space:
+
+```{r}
+rootValues <- modelingDF[[rootVar]]
+histBreaks <- pretty(range(rootValues), n = 15) # use the same bins for presences and absences
+presHist <- hist(rootValues[modelingDF$presAbs == 1], breaks = histBreaks, plot = FALSE)
+absHist <- hist(rootValues[modelingDF$presAbs == 0], breaks = histBreaks, plot = FALSE)
+
+plot(presHist,
+     col = rgb(1, 0, 0, 1/4),
+     ylim = c(0, max(presHist$counts, absHist$counts)),
+     main = paste0("Histogram of ", rootVar,
+                   " \n(red are values at presences; \nblue are values at absences)"),
+     xlab = rootVar)
+plot(absHist,
+     col = rgb(0, 0, 1, 1/4),
+     add = TRUE)
+
+abline(v = rootValue, col = "green", lwd = 2)
+```
+
+We can also look at how this split translates into geographic space (even though it originated solely in environmental space). Every node of the tree corresponds to a region of the map: the cells that meet *all* of the conditions on the path from the root down to that node. `path.rpart()` lists those conditions, and the small helper function below turns them into a TRUE/FALSE map.
+
+```{r}
+# Map the region of geographic space that falls into one node of a tree.
+# `conditions` is a node's path from path.rpart(), e.g. c("root", "Mean.Diurnal.Range>=5.919").
+# (path.rpart() rounds split values to 4 significant digits, which is plenty for a map.)
+regionFromPath <- function(conditions, env) {
+  region <- TRUE                                 # start with everywhere...
+  for (condition in setdiff(conditions, "root")) {
+    pieces <- strsplit(condition, "<|>=")[[1]]   # e.g. "Mean.Diurnal.Range" and "5.919"
+    layer <- env[[trimws(pieces[1])]]            # that variable's map
+    value <- as.numeric(pieces[2])               # the split value
+    if (grepl(">=", condition)) {
+      region <- region & (layer >= value)        # ...and ("&") keep only the cells that
+    } else {                                     # meet each condition in turn
+      region <- region & (layer < value)
+    }
+  }
+  region
+}
+
+# Training absences (0) and presences (1) in a node, and the class the tree predicts there
+nodeSummary <- function(tree, node) {
+  info <- tree$frame[as.character(node), ]
+  counts <- info$yval2[, 2:3]                    # numbers of training 0s and 1s in the node
+  list(absences = counts[1], presences = counts[2],
+       prediction = c("absence", "presence")[info$yval]) # yval = 1 for class "0", 2 for class "1"
+}
+
+# node 2 is the root's left branch
+rootRegion <- regionFromPath(path.rpart(mod1, nodes = 2)[[1]], envStack)
+plot(rootRegion, col = c("grey80", "lightgreen"),
+     main = "Region corresponding to root level split")
+points(trainData$x[trainData$presAbs == 1], trainData$y[trainData$presAbs == 1], pch = 20, col = "red")
+points(trainData$x[trainData$presAbs == 0], trainData$y[trainData$presAbs == 0], pch = 20, col = "blue")
+
+rightBranch <- nodeSummary(mod1, 3) # node 3 is the root's right branch
+```
+
+Note that the right branch of this node is a terminal node, or leaf node, which predicts `r rightBranch$prediction` for all points in the grey (as opposed to green) region above (`r rightBranch$presences` training presences and `r rightBranch$absences` training absences).
+
+Why was this split chosen? It had the highest Gini gain among all candidate splits (all possible variables at all possible split points).
+
+Continuing, the left branch of this node continues splitting before reaching a leaf node. We can look at the leftmost leaf node in the tree by following the splits.
+
+```{r}
+# leaves are the rows of mod1$frame marked "<leaf>"; they are listed from left to right
+leaves <- as.numeric(rownames(mod1$frame)[mod1$frame$var == "<leaf>"])
+leftmostLeaf <- leaves[1]
+leafPath <- path.rpart(mod1, nodes = leftmostLeaf)[[1]]
+leftLeaf <- nodeSummary(mod1, leftmostLeaf)
+
+# the same conditions in words, and the variables involved, for the text below
+leafRule <- sub(">=", " is greater than or equal to ", leafPath[-1], fixed = TRUE)
+leafRule <- sub("<", " is less than ", leafRule, fixed = TRUE)
+leafVars <- unique(trimws(sub("(<|>=).*$", "", leafPath[-1])))
+```
+
+This node corresponds to areas where `r paste(leafRule, collapse = " **and** ")`. Note that the presence of `r length(leafVars)` variables along this path corresponds to a `r length(leafVars)`-way interaction. This is a terminal node, and the tree predicts `r leftLeaf$prediction` in the green region shown below, since there were `r leftLeaf$absences` absences (blue) and `r leftLeaf$presences` presences (red) in the training data that fell into this leaf.
+
+```{r}
+leafRegion <- regionFromPath(leafPath, envStack)
+plot(leafRegion, col = c("grey80", "lightgreen"),
+     main = "Region corresponding to leftmost leaf node")
+points(trainData$x[trainData$presAbs == 1], trainData$y[trainData$presAbs == 1], pch = 20, col = "red")
+points(trainData$x[trainData$presAbs == 0], trainData$y[trainData$presAbs == 0], pch = 20, col = "blue")
+```
+
+So how well does this tree predict the test data?
+
+```{r}
+trainPreds1 <- predict(mod1, newdata = trainData)
+testPreds1 <- predict(mod1, newdata = testData)
+
+auc(roc(predictor = as.vector(trainPreds1[, 2]), response = trainData$presAbs))
+auc(roc(predictor = as.vector(testPreds1[, 2]), response = testData$presAbs))
+```
+
+How does all of this change if we modify the tree complexity? There are a few control options that affect tree complexity:
+
+* 'minsplit' is the minimum number of points that must fall into a node to attempt splitting (the default is 20);
+* 'minbucket' is the minimum number of points in a terminal/leaf node (the default is minsplit/3);
+* 'cp' is a complexity parameter that precludes splits that improve fit by less than this factor (the default is 0.01);
+* 'maxdepth' is the maximum depth of the tree where the root is 0 (the default is 30).
+
+(If you set only one of minsplit and minbucket, rpart sets the other to match, so `minbucket = 20` below also makes minsplit 60.)
+
+```{r}
+#| fig-height: 6
+simplerTreeOptions <- rpart.control(minbucket = 20)
+mod2 <- rpart(presAbs ~ Mean.Diurnal.Range + Isothermality + Mean.Temperature.of.Wettest.Quarter,
+              data = trainData,
+              method = "class",
+              control = simplerTreeOptions)
+rpart.plot(mod2, extra = 1, box.palette = "BuRd")
+```
+
+```{r}
+#| fig-height: 9
+#| fig-width: 12
+complexTreeOptions <- rpart.control(cp = 0)
+set.seed(2468) # rpart's internal cross-validation (see below) assigns folds at random
+mod3 <- rpart(presAbs ~ Mean.Diurnal.Range + Isothermality + Mean.Temperature.of.Wettest.Quarter,
+              data = trainData,
+              method = "class",
+              control = complexTreeOptions)
+rpart.plot(mod3, extra = 1, box.palette = "BuRd")
+```
+
+Note that in addition to these complexity parameters, rpart is doing cross-validation internally (you can control the number of folds with 'xval' in rpart.control; the default is 10). It does not prune the tree automatically based on the cross-validation: the tree you get is pruned only according to cp. Instead, it stores the cross-validated error (`xerror`, relative to the error at the root) for each candidate value of cp, which you can use to choose cp and then "prune" the tree (remove leaf nodes that don't help "enough" or don't generalize well) with `prune()`:
+
+```{r}
+#| fig-height: 6
+printcp(mod3)
+plotcp(mod3)
+
+# prune back to the cp value with the lowest cross-validated error
+bestCp <- mod3$cptable[which.min(mod3$cptable[, "xerror"]), "CP"]
+mod3pruned <- prune(mod3, cp = bestCp)
+rpart.plot(mod3pruned, extra = 1, box.palette = "BuRd")
+```
+
+How is the tree affected if we include more variables? Here's an example with the first 12 WORLDCLIM variables. We can look at predictive performance of this model on the training and test data sets. There is also a variable importance measure in the model: "A variable may appear in the tree many times, either as a primary or a surrogate variable. An overall measure of variable importance is the sum of the goodness of split measures for each split for which it was the primary variable, plus goodness * (adjusted agreement) for all splits in which it was a surrogate."
+
+```{r}
+#| fig-height: 7
+#| fig-width: 10
+mod4 <- rpart(presAbs ~ Annual.Mean.Temperature +
+                Mean.Diurnal.Range +
+                Isothermality +
+                Temperature.Seasonality +
+                Max.Temperature.of.Warmest.Month +
+                Min.Temperature.of.Coldest.Month +
+                Temperature.Annual.Range +
+                Mean.Temperature.of.Wettest.Quarter +
+                Mean.Temperature.of.Driest.Quarter +
+                Mean.Temperature.of.Warmest.Quarter +
+                Mean.Temperature.of.Coldest.Quarter +
+                Annual.Precipitation,
+              data = trainData,
+              method = "class")
+rpart.plot(mod4, extra = 1, box.palette = "BuRd")
+
+trainPreds4 <- predict(mod4, newdata = trainData)
+testPreds4 <- predict(mod4, newdata = testData)
+auc(roc(predictor = as.vector(trainPreds4[, 2]), response = trainData$presAbs))
+auc(roc(predictor = as.vector(testPreds4[, 2]), response = testData$presAbs))
+mod4$variable.importance
+```
+
+Note that while we have explored a classification example (presence vs. absence), trees work for regression too. The key difference is the criterion for choosing split points (e.g., setting parameter method="anova").
+
+# Disadvantages
+
+We have seen some of the advantages of trees, like flexibility and interpretability, above. One disadvantage of trees is that they have high variance. Consider fitting trees to replicate bootstrap samples of the training data. Ideally, we'd like to get very similar trees (the same 'story' about the data) from the different samples.
+
+::: {.callout-important title="Exercise 1"}
+Run the next chunk of code on bootstraps of the training data 10 or so times and check out the differences in trees, predictive performance, and variable importance.
+:::
+
+```{r}
+#| fig-height: 6
+# no set.seed() here on purpose: each run draws a different bootstrap sample
+trainDataSamp <- trainData[sample(nrow(trainData), replace = TRUE), ]
+mod5 <- rpart(presAbs ~ Mean.Diurnal.Range +
+                Isothermality +
+                Mean.Temperature.of.Wettest.Quarter,
+              data = trainDataSamp,
+              method = "class")
+rpart.plot(mod5, extra = 1, box.palette = "BuRd")
+
+trainPreds5 <- predict(mod5,
+                       newdata = trainDataSamp)
+auc(roc(predictor = as.vector(trainPreds5[, 2]),
+        response = trainDataSamp$presAbs))
+
+testPreds5 <- predict(mod5,
+                      newdata = testData)
+auc(roc(predictor = as.vector(testPreds5[, 2]),
+        response = testData$presAbs))
+
+mod5$variable.importance
+```
+
+# Turn in
+
+**(on Canvas, by the due date on Canvas)** Please post to the online discussion of this lab. Please include brief descriptions of your exploration of the exercise, with any relevant plots. Please also include, if applicable:
+
+* Any key take-aways from this lab that you want to remember for any future projects you may conduct in which you use species distribution models.
+* Any remaining questions or confusions do you have that you might like to learn more about.
+
+# Further Resources
+
+[rpart vignette](https://cran.r-project.org/web/packages/rpart/vignettes/longintro.pdf)

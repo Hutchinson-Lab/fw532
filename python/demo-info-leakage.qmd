@@ -1,0 +1,282 @@
+---
+title: "Demo: Information Leakage"
+subtitle: "FW 532 · Python version"
+---
+
+**You Will Need:** the course raster stack (`data/envStack.tif`), the helper module `sdmlab.py`,
+and the Python packages numpy, pandas, matplotlib, scipy, statsmodels, scikit-learn, and rasterio
+(see `requirements.txt`). Run the cells in order from top to bottom.
+
+```{python}
+# Running on Google Colab? This cell downloads the course files. (Anywhere else it does nothing.)
+import os, sys
+if "google.colab" in sys.modules:
+    if not os.path.exists("/content/fw532"):
+        !git clone -q --depth 1 https://github.com/Hutchinson-Lab/fw532.git /content/fw532
+        %pip install -q rasterio
+    os.chdir("/content/fw532/python")
+```
+
+Setup.
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from scipy import stats
+from sklearn.metrics import roc_curve, roc_auc_score
+
+import sdmlab as sdm   # course helpers for rasters
+
+env_stack = sdm.load_env()
+```
+
+Generate a new raster variable which is precipitation seasonality plus noise in the south (highly
+correlated) and random noise in the north. The north/south boundary is latitude 45.
+
+```{python}
+prec_seas = env_stack["Precipitation.Seasonality"]
+
+rng = np.random.default_rng(2023)
+noise = rng.normal(size=prec_seas.shape)   # one standard normal draw per cell
+noise[np.isnan(prec_seas)] = np.nan        # mask: no data in the ocean
+sim_rast = prec_seas + noise
+
+# latitude of each row of the grid (cell centres), turned into a north/south map
+row_lat = env_stack.xy(np.arange(env_stack.shape[0]), 0)[1]
+north = np.repeat(row_lat[:, None] > 45, env_stack.shape[1], axis=1)   # True north of 45 degrees
+
+north_rast = np.where(north, sim_rast - prec_seas, np.nan)   # in the north: just the noise
+south_rast = np.where(north, np.nan, sim_rast)               # in the south: seasonality + noise
+new_var = np.where(north, north_rast, south_rast)            # put the two halves back together
+
+new_stack = sdm.EnvStack(np.stack([prec_seas, new_var]), ["Precipitation.Seasonality", "simRast"],
+                         env_stack.xmin, env_stack.ymax, env_stack.res, env_stack.crs)
+new_stack.plot(ncols=2, panel_size=(6, 3.6));
+```
+
+Sample data from the south. Generate a species that responds to precipitation seasonality.
+
+```{python}
+def logistic(x):
+    return 1 / (1 + np.exp(-x))
+
+def scale_columns(df):
+    """Scale each column to mean 0 and sd 1 (like apply(..., 2, scale) in R)."""
+    return (df - df.mean()) / df.std()
+
+# get points
+n_points = 1000
+# n_points = 3000
+sim_pts = new_stack.mask(~north).sample_random(n_points, seed=1234)   # southern cells only
+lat_longs = sim_pts[["x", "y"]]
+
+# scale the climate variables:
+scaled_env = scale_columns(sim_pts[["Precipitation.Seasonality", "simRast"]])
+
+# set parameters
+intercept = -1.5
+beta1 = -1.5
+p_occ = logistic(intercept + beta1 * sdm.scale(prec_seas))
+
+# get the values that correspond to the points we selected:
+p_occs = sdm.extract(p_occ, env_stack, lat_longs["x"], lat_longs["y"])
+
+# sample from these probabilities (a *different* seed for a different random step; see Lab 1):
+rng = np.random.default_rng(5678)
+pres_abs = rng.binomial(n=1, p=p_occs)
+
+# put response and variables together in a DataFrame:
+modeling_df = pd.concat([pd.Series(pres_abs, name="presAbs"), scaled_env, lat_longs], axis=1)
+
+# plot the result
+def plot_pres_abs(data, title):
+    ax = sdm.plot_map(p_occ, env_stack, title=title)
+    absent = data["presAbs"] == 0
+    ax.scatter(data.loc[absent, "x"], data.loc[absent, "y"], s=6, color="blue")
+    ax.scatter(data.loc[~absent, "x"], data.loc[~absent, "y"], s=6, color="red")
+    return ax
+
+plot_pres_abs(modeling_df, "Probability of occurrence, with the southern sample");
+```
+
+Split these data randomly in half for training and testing. Fit a model to the WRONG variable -
+the simulated raster that is correlated with precipitation seasonality in the south.
+
+```{python}
+train_data = modeling_df.iloc[:n_points // 2]
+test_data = modeling_df.iloc[n_points // 2:]
+
+model_new = sm.GLM(train_data["presAbs"], sm.add_constant(train_data[["simRast"]]),
+                   family=sm.families.Binomial()).fit()
+print(model_new.params)
+```
+
+Predict on the randomly withheld (southern) test data.
+
+```{python}
+pred_probs = model_new.predict(sm.add_constant(test_data[["simRast"]]))
+
+resids = np.abs(pred_probs - test_data["presAbs"])
+fig, ax = plt.subplots(figsize=(7, 4))
+sc = ax.scatter(test_data["x"], test_data["y"], c=resids, cmap="Reds", s=10, vmin=0)
+fig.colorbar(sc, ax=ax, label="resids")
+ax.set_aspect("equal")
+ax.set_facecolor("0.85");   # grey background so that small (white) residuals still show
+```
+
+Test residuals for spatial autocorrelation - reject the null that there is none.
+
+Moran's I measures whether nearby points have similar values. With weights $w_{ij}$ (here,
+inverse distance, so close pairs count most), it is
+
+$$ I = \frac{n}{\sum_{ij} w_{ij}} \; \frac{\sum_{ij} w_{ij} (x_i - \bar x)(x_j - \bar x)}{\sum_i (x_i - \bar x)^2}. $$
+
+With no spatial autocorrelation its expected value is $-1/(n-1)$, close to 0; positive values mean
+that nearby residuals are alike. The function below follows R's `ape::Moran.I()`: it scales each
+row of weights to sum to 1, and computes the standard deviation of $I$ under "randomization" (as if
+the observed residuals had been shuffled among the locations at random). Then
+$z = (I - E[I]) / \text{sd}$ is compared to a standard normal distribution.
+
+```{python}
+def morans_i(x, weight):
+    """Moran's I with a z-test, computed the same way as ape::Moran.I() in R."""
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    row_sums = weight.sum(axis=1)
+    row_sums[row_sums == 0] = 1
+    w = weight / row_sums[:, None]            # each row of weights sums to 1
+    s = w.sum()
+    y = x - x.mean()
+    observed = (n / s) * (y @ w @ y) / (y @ y)
+    expected = -1 / (n - 1)
+    # variance under randomization
+    s1 = 0.5 * np.sum((w + w.T) ** 2)
+    s2 = np.sum((w.sum(axis=1) + w.sum(axis=0)) ** 2)
+    k = (np.sum(y**4) / n) / (np.sum(y**2) / n) ** 2   # kurtosis of x
+    var = ((n * ((n**2 - 3 * n + 3) * s1 - n * s2 + 3 * s**2)
+            - k * (n * (n - 1) * s1 - 2 * n * s2 + 6 * s**2))
+           / ((n - 1) * (n - 2) * (n - 3) * s**2) - 1 / (n - 1) ** 2)
+    sd = np.sqrt(var)
+    p_value = 2 * stats.norm.sf(abs(observed - expected) / sd)   # two-sided
+    return {"observed": observed, "expected": expected, "sd": sd, "p.value": p_value}
+
+# distances between test points (in degrees of longitude/latitude)
+xy = test_data[["x", "y"]].to_numpy()
+resid_dists = np.sqrt(((xy[:, None, :] - xy[None, :, :]) ** 2).sum(axis=2))
+with np.errstate(divide="ignore"):    # 1/0 on the diagonal; we set it to 0 next
+    resid_dists_inv = 1 / resid_dists
+np.fill_diagonal(resid_dists_inv, 0)
+
+moran = morans_i(resids, resid_dists_inv)
+moran
+```
+
+A check that doesn't rely on the normal approximation is a **permutation test**: shuffle the
+residuals among the locations many times, recompute $I$ each time, and see how often a shuffled
+value is at least as large as the observed one.
+
+```{python}
+rng = np.random.default_rng(3333)
+perm_i = [morans_i(rng.permutation(resids.to_numpy()), resid_dists_inv)["observed"] for _ in range(999)]
+p_perm = (1 + np.sum(np.array(perm_i) >= moran["observed"])) / (999 + 1)
+print(f"Permutation p-value (one-sided, 999 shuffles): {p_perm:.3f}")
+```
+
+Look at ROC on the random test holdout.
+
+pROC in R plots sensitivity against specificity, with the specificity axis reversed. Here we plot
+sensitivity (true positive rate) against the false positive rate (1 − specificity), which gives the
+same picture. pROC's `smooth()` (a fitted "binormal" curve) has no scikit-learn equivalent, so we
+skip it. In place of pROC's bootstrap confidence intervals at each threshold (`ci(of =
+"thresholds")`), we draw a bootstrap band around the curve: resample the test points with
+replacement, recompute the ROC curve, and repeat.
+
+```{python}
+def plot_roc(y, p, ax, color="black", label=None, band=True, n_boot=500, seed=None):
+    """Plot an ROC curve, optionally with a 95% bootstrap band."""
+    y, p = np.asarray(y), np.asarray(p)
+    fpr, tpr, _ = roc_curve(y, p)
+    ax.plot(fpr, tpr, color=color, linewidth=2, label=label)
+    if band:
+        rng = np.random.default_rng(seed)
+        fpr_grid = np.linspace(0, 1, 101)
+        boot_tpr = []
+        for _ in range(n_boot):
+            i = rng.integers(0, len(y), size=len(y))   # resample with replacement
+            f, t, _ = roc_curve(y[i], p[i])
+            boot_tpr.append(np.interp(fpr_grid, f, t))
+        lower, upper = np.percentile(boot_tpr, [2.5, 97.5], axis=0)
+        ax.fill_between(fpr_grid, lower, upper, color="grey", alpha=0.3, linewidth=0)
+    ax.plot([0, 1], [0, 1], color="grey", linewidth=1)
+    ax.set_xlabel("False positive rate (1 - specificity)")
+    ax.set_ylabel("Sensitivity")
+    ax.set_aspect("equal")
+    return ax
+
+fig, ax = plt.subplots(figsize=(5, 5))
+plot_roc(test_data["presAbs"], pred_probs, ax, seed=1111);
+```
+
+```{python}
+lower, auc, upper = sdm.auc_ci(test_data["presAbs"], pred_probs)   # DeLong interval, as in pROC
+print(f"Area under the curve: {auc:.4f}")
+print(f"95% CI: {lower:.4f}-{upper:.4f} (DeLong)")
+```
+
+Now sample some points in the north, where the variables are NOT correlated.
+
+```{python}
+new_pts = new_stack.mask(north).sample_random(n_points, seed=4321)   # northern cells only
+lat_longs = new_pts[["x", "y"]]
+
+# scale the climate variables:
+scaled_env = scale_columns(new_pts[["Precipitation.Seasonality", "simRast"]])
+
+# set parameters
+intercept = -1.5
+beta1 = -1.5
+p_occ = logistic(intercept + beta1 * sdm.scale(prec_seas))
+
+# get the values that correspond to the points we selected:
+p_occs = sdm.extract(p_occ, env_stack, lat_longs["x"], lat_longs["y"])
+
+# sample from these probabilities:
+rng = np.random.default_rng(8765)
+pres_abs = rng.binomial(n=1, p=p_occs)
+
+# put response and variables together in a DataFrame:
+modeling_df = pd.concat([pd.Series(pres_abs, name="presAbs"), scaled_env, lat_longs], axis=1)
+
+# plot the result
+plot_pres_abs(modeling_df, "Probability of occurrence, with the northern sample");
+```
+
+Predict values in the north based on the model fit in the south.
+
+```{python}
+new_preds = model_new.predict(sm.add_constant(modeling_df[["simRast"]]))
+
+fig, ax = plt.subplots(figsize=(5, 5))
+plot_roc(modeling_df["presAbs"], new_preds, ax, seed=2222)
+plt.show()
+
+lower, auc, upper = sdm.auc_ci(modeling_df["presAbs"], new_preds)
+print(f"Area under the curve: {auc:.4f}")
+print(f"95% CI: {lower:.4f}-{upper:.4f} (DeLong)")
+```
+
+Compare the curves.
+
+```{python}
+fig, ax = plt.subplots(figsize=(5, 5))
+plot_roc(test_data["presAbs"], pred_probs, ax, color="black", label="South: rand. holdout", band=False)
+plot_roc(modeling_df["presAbs"], new_preds, ax, color="red", label="North: independent/new data", band=False)
+ax.legend(loc="lower right");
+```
+
+So we have identified a case where a model looked decent on holdout data but transferred very
+poorly to a new location. But it was a contrived example, and I don't think that blockCV or similar
+would have detected the problem. How can we make this example 1) more realistic, and 2) something
+that can be addressed with a smarter approach to model evaluation???

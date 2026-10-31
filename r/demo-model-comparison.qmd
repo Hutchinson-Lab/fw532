@@ -1,0 +1,593 @@
+---
+title: "Demo: A Model Bake-off with Partial Dependence Plots"
+subtitle: "FW 532 · R version"
+---
+
+# Setup
+
+R packages: terra, here, pROC, rpart, pdp, plotly, lattice, randomForest, gbm, maxnet, ggcorrplot (all installed by `install_packages.R`).
+
+```{r}
+#| message: false
+library(terra)        # rasters (gridded maps)
+library(here)         # file paths relative to the project folder
+library(pROC)
+library(rpart)
+library(pdp)          # partial dependence plots
+library(plotly)       # interactive 3-d plots
+library(lattice)
+library(randomForest)
+library(gbm)
+library(maxnet)
+library(ggcorrplot)
+
+envStack <- rast(here("data", "envStack.tif"))
+
+# scale variables
+envStack <- scale(envStack)
+predVars <- names(envStack)   # the 20 environmental variables
+```
+
+# Simulate Data
+
+```{r}
+# define logistic function
+logistic = function(x) {exp(x)/(1+exp(x))}
+```
+
+```{r}
+#| fig-height: 4.5
+# get points
+nPoints = 3000
+set.seed(1234)
+simPts = spatSample(envStack, size = nPoints, method = "random",
+                    na.rm = TRUE, xy = TRUE)
+
+intercept = 0
+beta1 = -0.5
+beta2 = 0.5
+beta3 = -1
+pOccRaster = logistic(intercept +
+                  beta1 * scale(envStack$elevation) +
+                  beta2 * scale(envStack$Annual.Precipitation) +
+                  beta3 * scale(envStack$Annual.Precipitation)^2)
+names(pOccRaster) = "pOcc"
+
+# get the values that correspond to the points we selected:
+pOccs = extract(pOccRaster, simPts[, c("x", "y")], ID = FALSE)$pOcc
+
+# sample from these probabilities (a new seed for a new random step; see Lab 1):
+set.seed(5678)
+presAbs = rbinom(n=nPoints,size=1,prob=pOccs)
+
+# put response and variables together in a data.frame:
+presAbsFactor = factor(presAbs)   # levels "0" (absence) and "1" (presence), for rpart and randomForest
+modelingDF = cbind(presAbs,presAbsFactor,simPts)
+
+# plot the result
+plot(pOccRaster,col=terrain.colors(100))
+points(simPts$x[presAbs==0], simPts$y[presAbs==0], col="blue", pch=20)
+points(simPts$x[presAbs==1], simPts$y[presAbs==1], col="red", pch=20)
+legend("left",c("detection","non-detection"),col=c("red","blue"),pch=c(20,20),inset=0.02)
+
+# split into training, tuning/validation, and test (1000 points each).
+# spatSample() returns the points in random order, so each block of rows is a random subset.
+trainData = modelingDF[1:(nPoints/3),]
+valData = modelingDF[(nPoints/3 + 1):(2*nPoints/3),]
+testData = modelingDF[(2*nPoints/3 + 1):nPoints,]
+```
+
+In simulation, we can evaluate in a number of ways. We can assess predictive power, just like with real data. But we can also look at whether the correct environmental relationships are estimated. In the above, we used a simple parametric equation to generate the data. For models of this same form, we can look directly at whether the estimated coefficients match the true parameters. But some types of models don't produce coefficients for comparison.
+
+Partial dependence plots (PDPs) can be a useful tool for examining the learned relationships. The package 'pdp' produces these from fitted models, but since our data-generating equation is not in the format of a model, we'll make this first one "by hand." We'll set up sequences of values for the two relevant variables. For every possible pair of values, we'll compute the probability of occurrence. Then we can make a 3-d plot of the probability surface in feature space (since we only have 2 relevant features to consider). (Drag the plot to rotate it.)
+
+```{r}
+granularity = 51
+x = seq(from=min(modelingDF$elevation),
+        to=max(modelingDF$elevation),
+        length.out=granularity)
+y = seq(from=min(modelingDF$Annual.Precipitation),
+        to=max(modelingDF$Annual.Precipitation),
+        length.out=granularity)
+
+PDP_truth = matrix(NA,nrow=length(x),ncol=length(y))
+for (i in 1:length(x)) {
+  for (j in 1:length(y)) {
+    PDP_truth[i,j] = logistic(intercept +
+                  beta1 * x[i] +
+                  beta2 * y[j] +
+                  beta3 * y[j]^2)
+  }
+}
+
+# Note: plotly expects the rows of z to go with y and the columns with x,
+# so we transpose our matrix (rows = elevation) with t().
+plot_ly(
+  x = x,
+  y = y,
+  z = t(PDP_truth),
+  type = "surface",
+  colorscale = "Viridis", # "Earth"
+  cmin=0,
+  cmax=1
+) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "elevation"),
+      yaxis = list(title = "Annual.Precipitation"),
+      zaxis = list(title = "p(spp)"),
+      camera = list(
+        eye = list(x = -1.5, y = -2, z = 1.2)
+      )
+    )
+  )
+```
+
+We can see that this species prefers lower elevations overall, and that there's a "sweet spot" for precipitation levels.
+
+First, we can try a parametric regression model, with the correctly specified model. (Note that the form of the formula below matches the form of the data-generating equation above, with the correct quadratic term.) Here, there is no model misspecification, and the error in the estimated coefficients occurs because we are estimating these population parameters from a finite sample. With more data points, the coefficients should get closer to the true values, and with fewer data points, we'd expect more variability.
+
+```{r}
+glmCorrect = glm(formula = presAbs ~ elevation + Annual.Precipitation + I(Annual.Precipitation^2),
+             data=trainData,
+             family = "binomial")
+summary(glmCorrect)
+```
+
+(The warning "fitted probabilities numerically 0 or 1 occurred" is harmless here: a few training points have very high precipitation, and the quadratic term gives them predicted probabilities extremely close to 0.)
+
+For each model, we'll produce predicted probabilities of occurrence at each test point too, for predictive performance comparisons later.
+
+```{r}
+preds_glmCorrect = logistic(coef(glmCorrect)[1] +
+                              coef(glmCorrect)[2]*testData$elevation +
+                              coef(glmCorrect)[3]*testData$Annual.Precipitation +
+                              coef(glmCorrect)[4]*(testData$Annual.Precipitation)^2)
+```
+
+In this case, comparing the estimated and true values of the coefficients is a great, direct way to compare the models. But for comparison with other approaches where this is not available, let's make a PDP as well.
+
+(Note that the calls to partial can take a little time.)
+
+```{r}
+PDP_glmCorrect = partial(object=glmCorrect,
+        pred.var=c("elevation","Annual.Precipitation"),
+        prob=TRUE)
+plotPartial(PDP_glmCorrect,
+            levelplot=FALSE,
+            zlab="p(spp)",
+            drape=TRUE,
+            colorkey=TRUE,
+            screen=list(z=40,x=-60),
+            col.regions=terrain.colors(100))
+```
+
+Really similar to the truth, as we'd expect. If you are in a position with sufficient prior knowledge to specify your parametric model correctly, go for it!
+
+What happens if we make a mistake though? Here's a parametric regression model where we've left off the quadratic term. This is model misspecification. Even with infinite data, this formula cannot represent the true model correctly. It will find the best possible linear approximation to the true model.
+
+```{r}
+glmMisspec = glm(formula = presAbs~elevation+Annual.Precipitation,
+             data=trainData,
+             family = "binomial")
+summary(glmMisspec)
+
+preds_glmMisspec = logistic(coef(glmMisspec)[1] +
+                              coef(glmMisspec)[2]*testData$elevation +
+                              coef(glmMisspec)[3]*testData$Annual.Precipitation)
+```
+
+So what does that probability surface look like?
+
+```{r}
+PDP_glmMisspec = partial(object=glmMisspec,
+        pred.var=c("elevation","Annual.Precipitation"),
+        prob=TRUE)
+plotPartial(PDP_glmMisspec,
+            levelplot=FALSE,
+            zlab="p(spp)",
+            drape=TRUE,
+            colorkey=TRUE,
+            screen=list(z=40,x=-60),
+            col.regions=terrain.colors(100))
+```
+
+Even the misspecified model above at least narrowed to the two relevant variables. What if we throw in all variables from our raster stack?
+
+```{r}
+formulaAll = reformulate(predVars, response = "presAbs")  # presAbs ~ all 20 variables
+glmMisspec_all = glm(formula = formulaAll,
+             data=trainData,
+             family = "binomial")
+summary(glmMisspec_all)
+```
+
+Look at the estimates and standard errors for Max.Temperature.of.Warmest.Month, Min.Temperature.of.Coldest.Month, and Temperature.Annual.Range: they are enormous. As we've discussed, having highly correlated variables in a model is always hard from an interpretation perspective, regardless of model form. But some models can be fitted just fine in the presence of correlated variables. This glm model however, struggles to even fit the model. Temperature.Annual.Range is *defined* as Max.Temperature.of.Warmest.Month minus Min.Temperature.of.Coldest.Month, so these three variables are perfectly collinear, and there is no unique best set of coefficients for them. (If the three were exactly collinear in the stored data, `glm()` would report one coefficient as `NA`, "not defined because of singularities"; here tiny rounding differences in the data file let it return huge, meaningless estimates instead.)
+
+The best way to deal with this would be to examine the correlation matrix, draw on prior knowledge, and subset these variables as wisely as we can.
+
+```{r}
+#| fig-height: 7
+#| warning: false
+# check out their correlation:
+correl = cor(trainData[, predVars], method='spearman')
+#print(correl,digits=2)
+ggcorrplot(correl)
+```
+
+I'll do this somewhat generously, so that we don't throw away our two relevant variables, but of course in practice there is a risk of dropping relevant variables. I'll drop anything that's correlated with the correct variables above 0.7 (or below -0.7).
+
+```{r}
+which(abs(correl["Annual.Precipitation",])>0.7)
+which(abs(correl["elevation",])>0.7)
+```
+
+```{r}
+#| fig-height: 6
+#| warning: false
+toKeep = setdiff(predVars, c("Precipitation.of.Wettest.Month", "Precipitation.of.Driest.Month",
+                             "Precipitation.of.Wettest.Quarter", "Precipitation.of.Driest.Quarter",
+                             "Precipitation.of.Warmest.Quarter", "Precipitation.of.Coldest.Quarter"))
+correl2 = cor(trainData[, toKeep], method='spearman')
+#print(correl2,digits=2)
+ggcorrplot(correl2)
+```
+
+A lot of the temperature metrics are also correlated. Let's keep Annual.Mean.Temperature and drop anything correlated with it above 0.7 (or below -0.7).
+
+```{r}
+which(abs(correl["Annual.Mean.Temperature",])>0.7)
+```
+
+Temperature.Annual.Range just misses this cutoff (its correlation with Annual.Mean.Temperature is `r round(correl["Annual.Mean.Temperature", "Temperature.Annual.Range"], 2)`), but it is the difference of two variables we just dropped, so we'll drop it too.
+
+```{r}
+#| warning: false
+toKeep = c("Annual.Mean.Temperature", "Mean.Diurnal.Range",
+           "Mean.Temperature.of.Wettest.Quarter", "Annual.Precipitation",
+           "Precipitation.Seasonality", "elevation")
+correl3 = cor(trainData[, toKeep], method='spearman')
+#print(correl3,digits=2)
+ggcorrplot(correl3)
+```
+
+Let's use this subset below.
+
+```{r}
+formula6var = reformulate(toKeep, response = "presAbs")
+formula6varCART = reformulate(toKeep, response = "presAbsFactor")  # factor response for classification
+formula6var
+```
+
+```{r}
+glmMisspec_all = glm(formula = formula6var,
+             data=trainData,
+             family = "binomial")
+summary(glmMisspec_all)
+```
+
+```{r}
+# intercept + each variable times its coefficient (same order as in the formula):
+preds_glmMisspec_all = as.vector(logistic(as.matrix(cbind(1, testData[, toKeep])) %*% coef(glmMisspec_all)))
+# (predict(glmMisspec_all, newdata = testData, type = "response") gives the same values)
+```
+
+Here is the PDP for elevation and Annual.Precipitation from the misspecified model with linear effects of other variables:
+
+```{r}
+PDP_glmMisspec_all = partial(object=glmMisspec_all,
+        pred.var=c("elevation","Annual.Precipitation"),
+        prob=TRUE)
+plotPartial(PDP_glmMisspec_all,
+            levelplot=FALSE,
+            zlab="p(spp)",
+            drape=TRUE,
+            colorkey=TRUE,
+            screen=list(z=40,x=-60),
+            col.regions=terrain.colors(100))
+```
+
+You might ask: how is this related to all the other variables?
+The answer is: this is the average or partial dependence of the probability of occurrence on the joint values of elevation and Annual.Precipitation, after accounting for the average effects of the other variables. Each (x,y) point in this plot is computed by setting the values of elevation and Annual.Precipitation for ALL training points to x and y, leaving the values of the other variables at the training point untouched. Then, the probability of occurrence is computed with these specified values of elevation and Annual.Precipitation. These probabilities are averaged over all training points. This is repeated for all (x,y) pairs represented in the plot.
+
+Now let's move on to some tree-based methods. From here on out, we'll proceed with putting those 6 variables into the models. The idea is that we're in a setting where we don't have the prior knowledge to narrow these down further, and we want to leverage these ML techniques that have some built in feature selection/engineering to help out.
+
+For the sake of visualization, we'll fit an individual tree.
+
+```{r}
+CART_all = rpart(formula6varCART,
+             data=trainData,
+             method='class')
+preds_CART_all = predict(CART_all,
+                      newdata=testData)   # one column per class: "0" and "1"
+```
+
+For classification models like this one, `partial()` uses the *first* class ("0", absence) unless we tell it otherwise, so we set `which.class = 2` to get the probability of the second class, "1" (presence). (For the glm above and the gbm below, `partial()` already uses the probability of a 1.)
+
+```{r}
+PDP_CART_all = partial(object=CART_all,
+        pred.var=c("elevation","Annual.Precipitation"),
+        prob=TRUE,
+        which.class=2)
+plotPartial(PDP_CART_all,
+            levelplot=FALSE,
+            zlab="p(spp)",
+            drape=TRUE,
+            colorkey=TRUE,
+            screen=list(z=40,x=-60),
+            col.regions=terrain.colors(100))
+```
+
+Blocky. But we know that single trees are not our best bet.
+
+For the other models, let's do a little parameter tuning on the validation set.
+
+For random forests, let's choose the tuning parameters that produce the best AUC on the validation set from among mtry={1,2,3,4,5,6} and ntree={500,1000,2000,4000}. (This loop fits 24 forests, so it takes about a minute.)
+
+```{r}
+mtrys = c(1:6)
+ntrees = c(500,1000,2000,4000)
+valAUCs = array(data=NA,dim=c(length(mtrys),length(ntrees)),
+                dimnames=list(mtry=mtrys, ntree=ntrees))
+set.seed(101)   # random forests are random: set a seed so the results are reproducible
+for (m in 1:length(mtrys)) {
+  for (n in 1:length(ntrees)) {
+    RF = randomForest(formula6varCART,
+             data=trainData,
+             mtry=mtrys[m],
+             ntree=ntrees[n])
+    preds = predict(RF,
+                    type='prob',
+                    valData)
+    valAUCs[m,n] = auc(roc(response=valData$presAbsFactor,
+                  predictor=preds[,"1"],
+                  quiet=TRUE))
+  }
+}
+valAUCs
+bestValIdxs = which(valAUCs==max(valAUCs),arr.ind=TRUE)[1,]  # [1,]: the first one, in case of ties
+best_mtry = mtrys[bestValIdxs[1]]
+best_ntree = ntrees[bestValIdxs[2]]
+data.frame(best_mtry, best_ntree)
+```
+
+```{r}
+set.seed(102)
+RF_all = randomForest(formula6varCART,
+             data=trainData,
+             mtry=best_mtry,
+             ntree=best_ntree)
+preds_RF_all = predict(RF_all,
+                  type='prob',
+                  testData)
+```
+
+A PDP needs a prediction at every training point for every grid point, and a forest with hundreds of trees is slow to predict from. To keep this quick, we use a coarser grid (`grid.resolution = 20`, i.e. 20 × 20 points instead of the default 51 × 51).
+
+```{r}
+PDP_RF_all = partial(object=RF_all,
+        pred.var=c("elevation","Annual.Precipitation"),
+        prob=TRUE,
+        which.class=2,
+        grid.resolution=20)
+plotPartial(PDP_RF_all,
+            levelplot=FALSE,
+            zlab="p(spp)",
+            drape=TRUE,
+            colorkey=TRUE,
+            screen=list(z=40,x=-60),
+            col.regions=terrain.colors(100))
+```
+
+For BRTs, let's choose the tuning parameters that produce the best AUC on the validation set from among depth={1,2,3}, learning rate={0.001, 0.005, 0.01, 0.05}, and ntrees={500,1000,2000,3000,4000,5000}. Here, I'm calling gbm directly, instead of using gbm.step to choose the number of trees, just to show you another approach.
+
+We don't need to fit a separate model for every number of trees: a boosted model with 500 trees is just the first 500 trees of a bigger model. So we fit each depth/learning-rate combination once with the largest number of trees, and ask `predict()` for the predictions after 500, 1000, ..., 5000 trees (it returns one column per value of `n.trees`).
+
+```{r}
+depths = c(1:3)
+lrs = c(0.001, 0.005, 0.01, 0.05)
+ntrees = c(500,1000,2000,3000,4000,5000)
+#ntrees = seq(50,5000,50) # something like this would be a little closer to gbm.step
+valAUCs = array(data=NA,dim=c(length(depths),length(lrs),length(ntrees)),
+                dimnames=list(depth=depths, lr=lrs, ntrees=ntrees))
+set.seed(202)   # gbm uses a random half of the data for each tree (bag.fraction = 0.5)
+for (d in 1:length(depths)) {
+  for (l in 1:length(lrs)) {
+    BRT = gbm(formula6var,
+           data=trainData,
+           distribution="bernoulli",
+           interaction.depth=depths[d],
+           shrinkage=lrs[l],
+           n.trees=max(ntrees))
+    preds = predict(BRT,
+                  newdata=valData,
+                  n.trees=ntrees,   # predictions after each number of trees
+                  type="response")
+    for (n in 1:length(ntrees)) {
+      valAUCs[d,l,n] = auc(roc(response=valData$presAbs,
+                  predictor=preds[,n],
+                  quiet=TRUE))
+    }
+  }
+}
+valAUCs
+bestValIdxs = which(valAUCs==max(valAUCs),arr.ind=TRUE)[1,]
+best_depth = depths[bestValIdxs[1]]
+best_lr = lrs[bestValIdxs[2]]
+best_ntree = ntrees[bestValIdxs[3]]
+data.frame(best_depth, best_lr, best_ntree)
+```
+
+```{r}
+set.seed(203)
+BRT_all = gbm(formula6var,
+             data=trainData,
+             distribution="bernoulli",
+             interaction.depth=best_depth,
+             shrinkage=best_lr,
+             n.trees=best_ntree)
+preds_BRT_all = predict(BRT_all,
+                   newdata=testData,
+                   n.trees=best_ntree,
+                   type="response")
+```
+
+For gbm models, `partial()` uses a fast shortcut by default (`recursive = TRUE`; Friedman's weighted tree traversal): it averages the predictions on the log-odds scale and then converts that average to a probability. That is slightly different from averaging probabilities, as we do for the other models, but here the two agree to within about 0.02. (Set `recursive = FALSE` to average probabilities, at the cost of several minutes of computing.)
+
+```{r}
+PDP_BRT_all = partial(object=BRT_all,
+        pred.var=c("elevation","Annual.Precipitation"),
+        prob=TRUE,
+        train=trainData,
+        n.trees=BRT_all$n.trees)
+plotPartial(PDP_BRT_all,
+            levelplot=FALSE,
+            zlab="p(spp)",
+            drape=TRUE,
+            colorkey=TRUE,
+            screen=list(z=40,x=-60),
+            col.regions=terrain.colors(100))
+```
+
+To use a Maxent model, we can throw away our absence data, keep the presences, and sample background data - say, 10,000 background points.
+
+`maxnet()` normally adds any presences that aren't already in the background to the background (`addsamplestobackground = TRUE`), but it checks by comparing every presence with every background point, one pair at a time, which is very slow for big data sets (over two minutes per model with 100,000 background points). So we do the same thing ourselves, using the raster cell numbers, and turn that option off when we fit the models.
+
+```{r}
+set.seed(2468)   # a new seed for a new random step
+bkgndPts = spatSample(envStack, size = 10000, method = "random",
+                      na.rm = TRUE, cells = TRUE)
+presPts = trainData[trainData$presAbs==1, ]
+# presences whose cell isn't already in the background sample:
+addToBkgnd = !(cellFromXY(envStack, presPts[, c("x", "y")]) %in% bkgndPts$cell)
+maxnetTrainData = rbind(cbind(presAbs = 1, presPts[, toKeep]),               # presences
+                        cbind(presAbs = 0, bkgndPts[, toKeep]),              # background
+                        cbind(presAbs = 0, presPts[addToBkgnd, toKeep]))     # presences added to background
+table(maxnetTrainData$presAbs)
+```
+
+One way to tune Maxent is to try different feature classes, and we can also adjust the regularization multiplier.
+
+```{r}
+featureSets = c('l','lq','lqp','lqph')
+regMults = c(0.5, 0.75, 1, 1.25, 1.5)
+
+valAUCs = array(data=NA,dim=c(length(featureSets),length(regMults)),
+                dimnames=list(features=featureSets, regmult=regMults))
+for (f in 1:length(featureSets)) {
+  for (r in 1:length(regMults)) {
+  maxent = maxnet(p = maxnetTrainData$presAbs,
+                  data = maxnetTrainData[, toKeep],
+                  f = maxnet.formula(maxnetTrainData$presAbs,
+                                     maxnetTrainData[, toKeep],
+                                     classes=featureSets[f]),
+                  regmult = regMults[r],
+                  addsamplestobackground = FALSE)
+  preds = predict(maxent,
+                    type='cloglog',
+                    newdata=valData)
+  valAUCs[f,r] = auc(roc(response=valData$presAbs,
+                  predictor=as.vector(preds),
+                  quiet=TRUE))
+  }
+}
+```
+
+```{r}
+valAUCs
+bestValIdxs = which(valAUCs==max(valAUCs),arr.ind=TRUE)[1,]
+best_fs = featureSets[bestValIdxs[1]]
+best_rm = regMults[bestValIdxs[2]]
+data.frame(best_fs, best_rm)
+```
+
+The validation AUCs change with the regularization multiplier (across each row), as well as with the feature classes. Larger multipliers penalize the coefficients more, so the model keeps fewer features and the fitted response is smoother.
+
+::: {.callout-note collapse="true" title="regmult vs. regMult: why an earlier version of this demo found no effect"}
+An earlier version of this demo passed `regMult = ...` (capital M) and found that the regularization multiplier made no difference at all. The argument is actually called `regmult`. R matches argument names exactly, so `maxnet()` didn't recognize `regMult`; because `maxnet()` has a `...` argument, R passed it along to `glmnet()` without complaint, and `glmnet()` ignored it. Every model was fit with the default `regmult = 1`. You can check this yourself:
+
+```{r}
+f_lq = maxnet.formula(maxnetTrainData$presAbs, maxnetTrainData[, toKeep], classes = "lq")
+m_low  = maxnet(maxnetTrainData$presAbs, maxnetTrainData[, toKeep], f = f_lq,
+                regMult = 0.5, addsamplestobackground = FALSE)   # misspelled
+m_high = maxnet(maxnetTrainData$presAbs, maxnetTrainData[, toKeep], f = f_lq,
+                regMult = 1.5, addsamplestobackground = FALSE)   # misspelled
+identical(m_low$betas, m_high$betas)   # TRUE: the multiplier was ignored
+```
+
+It's also true that `glmnet()` rescales the penalty factors it is given (`penalty.factor`) to sum to the number of features, which would undo a multiplier on its own. But `maxnet()` compensates: it multiplies its sequence of overall penalties (`lambda`) by the average penalty factor, which includes `regmult`. So with the correct spelling, the penalty on each feature is proportional to `regmult`, as intended. (Type `maxnet` at the console to see the code.) The general lesson: functions with `...` arguments silently accept misspelled argument names, so double-check spelling against the help page.
+:::
+
+```{r}
+maxnet_all = maxnet(p = maxnetTrainData$presAbs,
+                    data = maxnetTrainData[, toKeep],
+                    f=maxnet.formula(maxnetTrainData$presAbs,
+                                     maxnetTrainData[, toKeep],
+                                     classes=best_fs),
+                    regmult=best_rm,
+                    addsamplestobackground = FALSE)
+
+preds_maxnet_all = as.vector(predict(maxnet_all,
+                   newdata=testData,
+                   type='cloglog'))
+```
+
+By default, `partial()` calls `predict()` without a `type`, and `predict()` for a maxnet model then returns its raw "link" scale, which isn't comparable to the probabilities from the other models. To get the PDP on the cloglog (0 to 1) scale that we used for the test-set predictions, we give `partial()` our own prediction function, `pred.fun`, which returns the average cloglog prediction over the data it is given. We also average over the 1000 training points (`train = trainData`), which, like the background points, are a random sample of the landscape. That puts the maxnet PDP on the same footing as the other models, and it is much faster than averaging over all 10,000+ background points.
+
+```{r}
+PDP_maxnet_all = partial(object=maxnet_all,
+        pred.var=c("elevation","Annual.Precipitation"),
+        pred.fun=function(object, newdata) {
+          mean(predict(object, newdata, type = "cloglog"))
+        },
+        train=trainData[, toKeep])
+plotPartial(PDP_maxnet_all,
+            levelplot=FALSE,
+            zlab="p(spp)",
+            drape=TRUE,
+            colorkey=TRUE,
+            screen=list(z=40,x=-60),
+            col.regions=terrain.colors(100))
+```
+
+Finally, let's compare all of the models on the test data.
+
+```{r}
+#| fig-width: 7
+#| fig-height: 7
+ROCcurve_glmCorrect = roc(response=testData$presAbs,
+               predictor=preds_glmCorrect, quiet=TRUE)
+ROCcurve_glmMisspec = roc(response=testData$presAbs,
+               predictor=preds_glmMisspec, quiet=TRUE)
+ROCcurve_glmMisspec_all = roc(response=testData$presAbs,
+               predictor=preds_glmMisspec_all, quiet=TRUE)
+
+ROCcurve_CART_all = roc(response=testData$presAbsFactor,
+               predictor=preds_CART_all[,"1"], quiet=TRUE)
+
+ROCcurve_RF_all = roc(response=testData$presAbsFactor,
+               predictor=preds_RF_all[,"1"], quiet=TRUE)
+ROCcurve_BRT_all = roc(response=testData$presAbs,
+               predictor=preds_BRT_all, quiet=TRUE)
+ROCcurve_maxnet_all = roc(response=testData$presAbs,
+               predictor=preds_maxnet_all, quiet=TRUE)
+
+plot(ROCcurve_glmCorrect)
+plot(ROCcurve_glmMisspec,col="red",add=TRUE)
+plot(ROCcurve_glmMisspec_all,col="orange",add=TRUE)
+plot(ROCcurve_CART_all,col="brown",add=TRUE)
+plot(ROCcurve_RF_all,col="green",add=TRUE)
+plot(ROCcurve_BRT_all,col="blue",add=TRUE)
+plot(ROCcurve_maxnet_all,col="purple",add=TRUE)
+
+legend(x="bottomright",
+       legend=c(paste("GLM_correct AUC:",round(auc(ROCcurve_glmCorrect),digits=3)),
+                paste("GLM_Misspec AUC:",round(auc(ROCcurve_glmMisspec),digits=3)),
+                paste("GLM_Misspec_all AUC:",round(auc(ROCcurve_glmMisspec_all),digits=3)),
+                paste("CART_all AUC:",round(auc(ROCcurve_CART_all),digits=3)),
+                paste("RF_all AUC:",round(auc(ROCcurve_RF_all),digits=3)),
+                paste("BRT_all AUC:",round(auc(ROCcurve_BRT_all),digits=3)),
+                paste("maxnet_all AUC:",round(auc(ROCcurve_maxnet_all),digits=3))),
+       lty=rep(1,7),
+       col = c("black","red","orange","brown","green","blue","purple"))
+```

@@ -1,0 +1,136 @@
+---
+title: "Get set up"
+subtitle: "Everything you need before Lab 1"
+---
+
+Every lab comes in two versions that do the same analysis: one in **R** and one in **Python**. Choose the language you want to learn or strengthen. You're welcome to do both. Setup takes about 15 minutes. Please do it before the first lab session so we can spend class time on the science.
+
+::: {.panel-tabset}
+
+## R
+
+### 1. Install R and an editor
+
+* **R** (version 4.3 or newer; the labs were tested with R 4.5): <https://cloud.r-project.org>
+* An editor: **RStudio Desktop** (<https://posit.co/download/rstudio-desktop/>) or **Positron** (<https://positron.posit.co/>). Both are free.
+
+If you already have R, check the version by typing `R.version.string` in the console. If it's older than 4.3, please update. Old versions can't install the current spatial packages.
+
+### 2. Download the R starter kit
+
+[Download fw532-R-labs.zip](downloads/fw532-R-labs.zip){.btn .btn-primary}
+
+Unzip it somewhere easy to find (for example, `Documents/fw532`). Inside you'll find:
+
+```
+fw532-R-labs/
+├── fw532.Rproj          ← double-click this to open the project
+├── install_packages.R   ← run once to install everything
+├── r/                   ← one .qmd notebook per lab
+├── data/envStack.tif    ← environmental layers used by every lab
+└── output/              ← files the labs write (e.g., for Maxent)
+```
+
+### 3. Open the project and install packages
+
+1. Double-click **`fw532.Rproj`**. RStudio opens with the project folder as the working directory. (In Positron: *File → Open Folder…* and choose `fw532-R-labs`.)
+2. In the **Console**, run:
+
+   ```r
+   source("install_packages.R")
+   ```
+
+   This installs the packages used during the term (it skips any you already have) and ends with *"Success! Read 20 environmental layers."* The first install can take several minutes.
+
+### 4. Run Lab 1
+
+Open `r/lab01-simulation.qmd`. Run each code chunk with the green ▶ button, or press **Ctrl+Shift+Enter** (**Cmd+Shift+Enter** on a Mac) with the cursor in a chunk. Plots appear under each chunk. To produce a full report, click **Render**.
+
+::: {.callout-tip title="Why a project?"}
+The labs locate the data with `here::here("data", "envStack.tif")`, which always starts from the folder containing `fw532.Rproj`. That's why you **don't** need `setwd()`, and why the labs work the same on every computer. If R says it can't find `envStack.tif`, you probably opened a `.qmd` file without opening the project first.
+:::
+
+## Python
+
+You can run the Python notebooks **in your browser with Google Colab** (nothing to install), or **on your own computer**. Colab is the quickest way to start. A local install is better for your term project.
+
+### Option A — Google Colab (no installation)
+
+1. On any lab page, click **Open in Colab**. You'll need a Google account.
+2. Run the first code cell. On Colab it downloads the course files and installs two extra packages (about 30 seconds).
+3. Run the remaining cells in order (**Shift+Enter**).
+4. To keep your edits, use *File → Save a copy in Drive*.
+
+::: {.callout-note}
+Colab sessions are temporary. Files a lab writes (e.g., Maxent inputs in Lab 6) disappear when the session ends, so download anything you want to keep.
+:::
+
+### Option B — On your own computer
+
+**1. Install Python.** Get it from <https://www.python.org/downloads/>. On Windows, tick *"Add python.exe to PATH"* in the installer. The labs were tested with Python 3.12 and 3.14; any version from 3.10 on should work.
+
+**2. Download the Python starter kit.**
+
+[Download fw532-python-labs.zip](downloads/fw532-python-labs.zip){.btn .btn-primary}
+
+```
+fw532-python-labs/
+├── python/
+│   ├── lab01-simulation.ipynb   ← one notebook per lab
+│   ├── sdmlab.py                ← small helper module for maps
+│   └── requirements.txt         ← list of packages
+├── data/envStack.tif            ← environmental layers used by every lab
+└── output/                      ← files the labs write
+```
+
+**3. Create an environment and install packages** (once). Open a terminal (*Command Prompt* or *PowerShell* on Windows, *Terminal* on a Mac) in the `fw532-python-labs` folder:
+
+::: {.panel-tabset}
+### Windows
+
+In **Command Prompt**:
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r python/requirements.txt
+```
+
+(In PowerShell, the activate step may be blocked by the default script policy. Command Prompt avoids that.)
+
+### macOS / Linux
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r python/requirements.txt
+```
+
+### conda / mamba
+
+```bash
+conda env create -f python/environment.yml
+conda activate fw532
+```
+:::
+
+A *virtual environment* (`.venv`) keeps this course's packages separate from anything else on your computer. Activate it (second line above) each time you open a new terminal.
+
+**4. Open a notebook.** With the environment active, run `jupyter lab` and open `python/lab01-simulation.ipynb`. In VS Code or Positron, open the folder and choose the `.venv` interpreter as the notebook kernel. Run cells in order with **Shift+Enter**.
+
+::: {.callout-tip title="What's sdmlab?"}
+R has the `terra` package for gridded maps (rasters). Python's tools for this are lower-level, so the course includes `sdmlab.py`, a short, readable module that loads the environmental layers, samples random locations, and draws maps. Everything else in the notebooks uses standard packages: **numpy**, **pandas**, **matplotlib**, **scikit-learn**, and **statsmodels**.
+:::
+
+:::
+
+## The course data
+
+Every lab reads the same file, `data/envStack.tif`: 20 environmental layers covering North America at 10-arc-minute resolution (about 13 km at 45° latitude). These are 19 WorldClim bioclimatic variables (averages for 1970–2000) plus elevation. The variables are described in the [data README](https://github.com/Hutchinson-Lab/fw532/blob/main/data/README.md).
+
+## Getting help
+
+* Error messages are information. Read the last line first, and paste it into the Canvas discussion along with the code that produced it.
+* **Windows: `pip` fails with a "Long Path" error?** Windows limits file paths to 260 characters, and JupyterLab has deeply nested files. Move the `fw532-python-labs` folder somewhere with a short path (e.g. `C:\fw532`), delete `.venv`, and repeat step 3.
+* Most "file not found" problems come from opening a lab outside its project folder (R) or moving a notebook away from `sdmlab.py` and `data/` (Python). Keep the kit's folder structure as it is.
+* Comfortable with git? You can clone the whole course repository instead of downloading the kits: <https://github.com/Hutchinson-Lab/fw532>.

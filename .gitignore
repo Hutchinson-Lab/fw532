@@ -1,0 +1,32 @@
+# Quarto build output (the site is built by GitHub Actions; _freeze/ IS committed)
+/_site/
+/.quarto/
+/downloads/
+**/*.quarto_ipynb
+
+# Files the labs write when students run them
+/output/
+*_files/
+r/*.html
+python/*.html
+
+# R
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Python
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local tool settings
+.claude/
+Rplots.pdf

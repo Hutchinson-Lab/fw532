@@ -1,0 +1,306 @@
+---
+title: "Lab 6: Maxent"
+subtitle: "FW 532 · R version"
+---
+
+**Goals:** To get familiar with Maxent, run some models in Java and R, and look at sensitivity to some of the parameters.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* The Maxent Java application (see below; it needs Java installed on your computer)
+* R packages: terra, maxnet, pROC, here (run `source("install_packages.R")` once to install everything for the term)
+
+Download Maxent version 3.4.4 [here](https://biodiversityinformatics.amnh.org/open_source/maxent/). We will be working largely from the Maxent [tutorial](https://biodiversityinformatics.amnh.org/open_source/maxent/Maxent_tutorial_2021.pdf).
+
+In this lab, you will generate data similarly to the other labs, and model it with the Maxent software following the steps in the tutorial. That is, you will replicate the steps of the tutorial using your own simulated data instead of (or in addition to) the data provided with the tutorial.
+
+# Generate Data
+
+This section is almost identical to our data generation from the early labs with the linear functions of covariates. The main difference is that we will only keep the presence points we generate, since we are simulating presence-only data. We will write these locations out to a file to be loaded into Maxent. We will also convert our environmental layers to ascii instead of tif format for Maxent.
+
+Set-up:
+
+```{r}
+#| message: false
+library(terra)      # rasters (gridded maps)
+library(maxnet)     # Maxent inside R
+library(pROC)       # ROC curves
+library(here)       # file paths relative to the project folder
+
+envStack <- rast(here("data", "envStack.tif"))
+
+# everything this lab writes goes in output/lab06/ inside the course project
+outDir <- here("output", "lab06")
+dir.create(file.path(outDir, "asciiRasters"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(outDir, "maxentOutput"), showWarnings = FALSE) # an empty folder for the Java app's results
+```
+
+Write out these rasters for Maxent to use. This takes a sec.
+
+```{r}
+# Write them back out in a new directory in ascii format
+for (layerName in names(envStack)) {
+  writeRaster(envStack[[layerName]],
+              filename = file.path(outDir, "asciiRasters", paste0(layerName, ".asc")),
+              filetype = "AAIGrid",              # ESRI ascii grid, the format Maxent reads
+              NAflag = -9999,                    # the "no data" code (e.g., ocean cells)
+              gdal = c("SIGNIFICANT_DIGITS=6"),  # 6 significant digits keeps the files smaller
+              overwrite = TRUE)
+}
+list.files(file.path(outDir, "asciiRasters"), pattern = "\\.asc$")
+```
+
+An `.asc` file is plain text: a six-line header, then one line of numbers per row of the raster. Here is the header of one of them:
+
+```{r}
+cat(readLines(file.path(outDir, "asciiRasters", "elevation.asc"), n = 6), sep = "\n")
+```
+
+The header gives the number of columns and rows, the coordinates of the lower-left corner, the cell size (in degrees), and the code for missing values. Maxent requires all the layers to have identical headers, which ours do because they come from one raster stack. (terra also writes a small `.prj` file, describing the coordinate system, and an `.asc.aux.xml` file next to each grid. Maxent ignores them.)
+
+# Simulate Data
+
+We will use simulated data again in the exercises below. This is the same virtual species as in Lab 1 (and the same random seeds, so the same sites).
+
+```{r}
+# define logistic function
+logistic <- function(x) { exp(x) / (1 + exp(x)) }
+
+# get points
+nPoints <- 1000
+set.seed(1234)
+simPts <- spatSample(envStack, size = nPoints, method = "random",
+                     na.rm = TRUE, xy = TRUE)
+
+# set parameters
+intercept <- -1.5
+beta1 <- -1.5
+beta2 <- -1.5
+beta3 <- 1.5
+pOccRaster <- logistic(intercept +
+                         beta1 * scale(envStack$Precipitation.Seasonality) +          # 15
+                         beta2 * scale(envStack$Min.Temperature.of.Coldest.Month) +   # 6
+                         beta3 * scale(envStack$Mean.Temperature.of.Wettest.Quarter)) # 8
+names(pOccRaster) <- "pOcc"
+
+# get the values that correspond to the points we selected:
+pOccs <- extract(pOccRaster, simPts[, c("x", "y")], ID = FALSE)$pOcc
+
+# sample from these probabilities (with a *different* seed; see Lab 1):
+set.seed(5678)
+presAbs <- rbinom(n = nPoints, size = 1, prob = pOccs)
+
+# put response and variables together in a data.frame:
+modelingDF <- cbind(presAbs, simPts)
+
+# plot the result
+plot(pOccRaster)
+points(simPts$x[presAbs == 1], simPts$y[presAbs == 1], col = "red", pch = 20)
+```
+
+`r sum(presAbs)` of the `r nPoints` sites are presences. Write these locations to a file for Maxent. Maxent wants three columns, in this order: the species name, the x coordinate (longitude), and the y coordinate (latitude).
+
+```{r}
+write.csv(data.frame(species = "simSpp", simPts[presAbs == 1, c("x", "y")]),
+          file = file.path(outDir, "simSppPres.csv"),
+          row.names = FALSE)
+
+head(read.csv(file.path(outDir, "simSppPres.csv")), 3)
+```
+
+# Maxent
+
+At this point, switch over to the Java app to run Maxent on these data.
+
+::: {.callout-note title="Where are the files?"}
+Everything Maxent needs is now in the `output/lab06/` folder of your course project (run `here("output", "lab06")` in the console to see the full path on your computer). In the Maxent window:
+
+* **Samples:** `output/lab06/simSppPres.csv`
+* **Environmental layers:** the folder `output/lab06/asciiRasters` (choose the folder itself, not the files inside it). All 20 layers are continuous.
+* **Output directory:** the empty folder `output/lab06/maxentOutput`
+* **Test sample file** (on the Settings panel, for the section below): `output/lab06/simSppTestPres.csv`
+:::
+
+With the Java app, follow the Maxent tutorial using the data you generated through these sections:
+
+* Getting started
+* Doing a run
+* Looking at a prediction
+    + In this section, try the suggestion in the tutorial to use a random seed for the test set. In addition, try supplying your own test set. Code to generate a test set for the simulated species is provided below.
+
+```{r}
+# same data generation with new random seeds
+set.seed(4321)
+testPts <- spatSample(envStack, size = nPoints, method = "random",
+                      na.rm = TRUE, xy = TRUE)
+
+# get the probabilities that correspond to the points we selected:
+testProbs <- extract(pOccRaster, testPts[, c("x", "y")], ID = FALSE)$pOcc
+
+# sample from these probabilities (again, a seed we haven't used yet):
+set.seed(8765)
+testResp <- rbinom(n = nPoints, size = 1, prob = testProbs)
+
+# plot the result
+plot(pOccRaster)
+points(simPts$x[presAbs == 1], simPts$y[presAbs == 1], col = "red", pch = 20)
+points(testPts$x[testResp == 1], testPts$y[testResp == 1], col = "blue", pch = 20)
+legend("bottomleft", legend = c("training presences", "test presences"),
+       col = c("red", "blue"), pch = 20, bg = "white")
+
+write.csv(data.frame(species = "simSpp", testPts[testResp == 1, c("x", "y")]),
+          file = file.path(outDir, "simSppTestPres.csv"),
+          row.names = FALSE)
+```
+
+Note that Maxent stores the predictions for these test points in an output file that ends with samplePredictions.csv in the output directory. You could read these back into R for further processing/evaluation if desired.
+
+Continue through the tutorial sections:
+
+* Output formats
+    + Create plots of each of the output formats for the simulated species.
+* Statistical analysis
+
+::: {.callout-tip title="Question"}
+**Suggested discussion point:** Describe each output format: what it shows and how they differ. Which seems most useful to you, in what context?
+:::
+
+In the next sections, you will do some model interpretation. Since you are working with simulated data, you KNOW which variables should show up as important and what their relationships to the prediction should be. In this example with all variables, you may find that the Maxent output doesn't represent the model you used to simulate the data very well.
+
+::: {.callout-tip title="Question"}
+**Suggested discussion question:** Why might this be the case? How do the results change if you ONLY include the relevant predictors? with just one irrelevant predictor that is minimally correlated with the true variables? with only linear features (since the true model is linear)?
+:::
+
+::: {.callout-important title="Exercise"}
+Do the following four sections of the tutorial with different settings to explore these questions.
+
+* Which variables matter most?
+* How does the prediction depend on the variables?
+* Feature types and response curves
+* Interactive exploration of predictions
+:::
+
+There is SO much more we could do, but we'll stop there for now. Browse through the rest of the tutorial to get a sense of what else it offers for future reference!
+
+## Note: Supplying your own background points to deal with sampling bias
+
+One other thing you may want to do with Maxent is to supply your own background points instead of having them sampled randomly from the rasters you provide. You might do this if you want your background points to reflect the same sampling bias as the presence points (see the Phillips et al (2009) reference at the bottom of this lab) so the bias 'factors out.' The background could be drawn from a known sampling effort distribution (or this could be provided to the Maxent software as a bias file), or from opportunistic records of similar species that were likely sampled with the same bias (i.e. an empirical sample from the effort distribution). You could simulate this by sampling background data from the rasters above in R, similarly to how we sampled presences (but without consulting the probability of occurrence). To supply background points to the Java app, you need to use the SWD format (a section of the tutorial we didn't get to). You can also supply the background points through the dismo::maxent interface using the 'a' argument in dismo::maxent. Finally, the 'maxnet' R package (below) requires background points, even if they are randomly sampled.
+
+# Running with the 'maxnet' package
+
+The maxnet package does not include ALL the functions of the Java version. (The ENMeval package, not used in this lab, adds some relevant functionality, such as tuning the settings by cross-validation.) But, it may be nice sometimes to run Maxent within R for comparison with other approaches or for other processing. maxnet fits the same model as the Java app, with the same feature classes and default regularization, by turning the problem into a heavily weighted logistic regression fitted with the glmnet package (Phillips et al. 2017).
+
+# Simulate presence-background data for Maxnet
+
+We use the same seeds as above for the sites (1234) and the coin flips (5678), so these are the same presences you gave the Java app. The background points get a seed of their own.
+
+```{r}
+# define logistic function
+logistic <- function(x) { exp(x) / (1 + exp(x)) }
+
+# get points
+nPoints <- 1000
+nBackground <- 2000
+set.seed(1234)
+simPts <- spatSample(envStack, size = nPoints, method = "random",
+                     na.rm = TRUE, xy = TRUE)
+set.seed(2468)
+background <- spatSample(envStack, size = nBackground, method = "random",
+                         na.rm = TRUE, xy = TRUE)
+
+# set parameters
+intercept <- -1.5
+beta1 <- -1.5
+beta2 <- -1.5
+beta3 <- 1.5
+pOccRaster <- logistic(intercept +
+                         beta1 * scale(envStack$Precipitation.Seasonality) +
+                         beta2 * scale(envStack$Min.Temperature.of.Coldest.Month) +
+                         beta3 * scale(envStack$Mean.Temperature.of.Wettest.Quarter))
+names(pOccRaster) <- "pOcc"
+
+# get the values that correspond to the points we selected:
+pOccs <- extract(pOccRaster, simPts[, c("x", "y")], ID = FALSE)$pOcc
+
+# sample from these probabilities:
+set.seed(5678)
+pres <- rbinom(n = nPoints, size = 1, prob = pOccs)
+
+# put response and variables together in a data.frame:
+predVars <- names(envStack)   # the 20 environmental variables
+modelingDF <- rbind(cbind(presBkgrnd = 1, simPts[pres == 1, ]),
+                    cbind(presBkgrnd = 0, background))
+
+# plot the result
+plot(pOccRaster)
+points(background$x, background$y, col = "blue", pch = 20)
+points(simPts$x[pres == 1], simPts$y[pres == 1], col = "red", pch = 20)
+```
+
+Here is a demo with the main maxnet functions. This is on the whole modeling data.frame, so you can consider predicting to independent test data as an exercise (optional).
+
+With `r sum(pres)` presences, maxnet's default feature classes are linear, quadratic, product, and hinge (the same rule the Java app uses; threshold features are off by default). To change the settings, use `regmult` (the regularization multiplier, default 1) and the formula argument, e.g. `f = maxnet.formula(p, data, classes = "lq")` for linear and quadratic features only. Fitting takes a few seconds.
+
+```{r}
+#| fig-height: 10
+#| fig-width: 10
+maxnetModel <- maxnet(p = modelingDF$presBkgrnd,
+                      data = modelingDF[, predVars])
+plot(maxnetModel, type = "cloglog")
+```
+
+Each panel varies one variable and holds all the others at their mean over the presence and background points.
+
+Individual effects:
+
+```{r}
+plot(maxnetModel, "Mean.Temperature.of.Wettest.Quarter") # default type = "link" (the linear predictor)
+```
+
+Prediction function example, but used on the same data that the model was fitted on.
+
+```{r}
+#| message: false
+maxnetPreds <- predict(maxnetModel,
+                       newdata = modelingDF[, predVars],
+                       type = "cloglog")
+ROCcurve <- roc(response = modelingDF$presBkgrnd,
+                predictor = as.vector(maxnetPreds))
+plot(ROCcurve) # plot it
+auc(ROCcurve)
+```
+
+Note that this AUC compares presences with *background* points, not absences (some background points fall where the species is present), and it is computed on the training data.
+
+terra's `predict()` applies the model to every cell, so we can compare the predicted map with the truth:
+
+```{r}
+#| fig-height: 4
+#| fig-width: 10
+maxnetMap <- predict(envStack, maxnetModel, type = "cloglog", na.rm = TRUE)
+plot(c(pOccRaster, maxnetMap),
+     main = c("True probability of occurrence", "maxnet prediction (cloglog)"),
+     range = c(0, 1))
+```
+
+Compare where the prediction is high and low, rather than the values themselves. Presence-only data can't tell a model how common the species is (prevalence is not identifiable), so the cloglog scale rests on an assumption rather than on the data.
+
+# Turn in
+
+**(on Canvas, by the due date on Canvas)** Please post to the online discussion of this lab. Please include brief descriptions of your exploration of the exercises, with any relevant plots. Please also include, if applicable:
+
+* Any key take-aways from this lab that you want to remember for any future projects you may conduct in which you use species distribution models.
+* Any remaining questions or confusions do you have that you might like to learn more about.
+
+# Further Resources
+
+See the tutorials and papers linked from the software page at the top of the lab. I'll add a few more:
+
+Renner, I. W., Elith, J., Baddeley, A., Fithian, W., Hastie, T., Phillips, S. J., Popovic, G., & Warton, D. I. (2015). Point process models for presence-only analysis. *Methods in Ecology and Evolution*, 6(4), 366–379. <https://doi.org/10.1111/2041-210X.12352>
+
+Yackulic, C. B., Chandler, R., Zipkin, E. F., Royle, J. A., Nichols, J. D., Campbell Grant, E. H., & Veran, S. (2013). Presence-only modelling using MAXENT: when can we trust the inferences? *Methods in Ecology and Evolution*, 4(3), 236–243. <https://doi.org/10.1111/2041-210x.12004>
+
+Phillips, S. J., Dudík, M., Elith, J., Graham, C. H., Lehmann, A., Leathwick, J., & Ferrier, S. (2009). Sample selection bias and presence-only distribution models: implications for background and pseudo-absence data. *Ecological Applications*, 19(1), 181–197. <https://doi.org/10.1890/07-2153.1>
+
+Phillips, S. J., Anderson, R. P., Dudík, M., Schapire, R. E., & Blair, M. E. (2017). Opening the black box: an open-source release of Maxent. *Ecography*, 40(7), 887–893. <https://doi.org/10.1111/ecog.03049>

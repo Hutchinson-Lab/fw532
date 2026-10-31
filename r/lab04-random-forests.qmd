@@ -1,0 +1,476 @@
+---
+title: "Lab 4: Random Forests (RF)"
+subtitle: "FW 532 · R version"
+---
+
+**Goals:**
+
+* To understand how random forest models are built and interpreted in R.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* R packages: terra, here, pROC, caret, randomForest, ranger, tictoc, pdp (run `source("install_packages.R")` once to install everything for the term)
+
+::: {.callout-note collapse="true" title="Working in the course R project"}
+Open `fw532.Rproj` (in RStudio or Positron) before you start. The `here()` function builds file paths starting from the project folder, so the same code works on everyone's computer and you never need to set your working directory. For example, `here("data", "envStack.tif")` points to the data file no matter where you put the project.
+:::
+
+# Setup
+
+New R packages this week: randomForest, ranger, tictoc (and pdp, briefly, at the end).
+
+```{r}
+#| message: false
+library(terra)        # rasters (gridded maps)
+library(here)         # file paths relative to the project folder
+library(pROC)
+library(caret)        # confusionMatrix()
+library(randomForest)
+library(ranger)
+library(tictoc)       # simple timers
+library(pdp)          # partial dependence plots for many model types
+
+envStack <- rast(here("data", "envStack.tif"))
+```
+
+# Generate Data
+
+This is the same data simulation as last lab, with a nonlinear function of the environmental variables. Feel free to experiment as well with the original linear version (commented out here) or a function of your own choosing.
+
+```{r}
+# define logistic function
+logistic <- function(x) {exp(x)/(1+exp(x))}
+
+# get points
+nPoints <- 1000
+set.seed(1234)
+simPts <- spatSample(envStack, size = nPoints, method = "random",
+                     na.rm = TRUE, xy = TRUE)
+
+# set parameters
+#intercept = -1.5
+#beta1 = -2
+#beta2 = -1.5
+#beta3 = 1.5
+#pOccRaster = logistic(intercept +
+#                  beta1 * scale(envStack$Precipitation.Seasonality) +
+#                  beta2 * scale(envStack$Min.Temperature.of.Coldest.Month) +
+#                  beta3 * scale(envStack$Mean.Temperature.of.Wettest.Quarter))
+
+intercept <- -0.25
+beta1 <- -1
+beta2 <- 1
+beta3 <- 1.5
+beta4 <- 1
+beta5 <- -1
+pOccRaster <- logistic(intercept +
+                  beta1 * scale(envStack$Mean.Diurnal.Range) +
+                  beta2 * scale(envStack$Isothermality) +
+                  beta3 * scale(envStack$Mean.Temperature.of.Wettest.Quarter) +
+                  beta4 * scale(envStack$Mean.Diurnal.Range)^2 + # quadratic term
+                  beta5 * scale(envStack$Isothermality) * scale(envStack$Mean.Temperature.of.Wettest.Quarter)) # interaction term
+names(pOccRaster) <- "pOcc"
+
+# get the values that correspond to the points we selected:
+pOccs <- extract(pOccRaster, simPts[, c("x", "y")], ID = FALSE)$pOcc
+
+# sample from these probabilities (a *different* seed than above; see Lab 1):
+set.seed(5678)
+presAbs <- rbinom(n = nPoints, size = 1, prob = pOccs)
+
+# put response and variables together in a data.frame:
+modelingDF <- cbind(presAbs, simPts)
+
+# plot the result
+plot(pOccRaster)
+points(modelingDF$x[modelingDF$presAbs == 0], modelingDF$y[modelingDF$presAbs == 0],
+       col = "blue", pch = 20)
+points(modelingDF$x[modelingDF$presAbs == 1], modelingDF$y[modelingDF$presAbs == 1],
+       col = "red", pch = 20)
+legend("left", c("detection", "non-detection"), col = c("red", "blue"), pch = c(20, 20))
+
+# split into training and test
+trainData <- modelingDF[1:(nPoints/2), ]
+testData <- modelingDF[(nPoints/2 + 1):nPoints, ]
+
+trainData$presAbsFact <- as.factor(trainData$presAbs) # the response must be a factor for randomForest to perform classification
+```
+
+(`spatSample()` returns the points in random order, so taking the first half for training and the second half for testing is a random split.)
+
+# Random Forests
+
+## A preliminary note about the bootstrap
+
+The papers we read referenced ~36% of the data as being out-of-bag (OOB) a few times. This is a property of bootstrap sampling. Experiment with this code to develop your intuition. [More explanation.](https://stats.stackexchange.com/questions/88980/why-on-average-does-each-bootstrap-sample-contain-roughly-two-thirds-of-observat?lq=1)
+
+```{r}
+# Single Sample:
+s <- sample(10, replace = TRUE) # bootstrap sample (with replacement)
+s
+is.element(1:10, s) # boolean vector of whether each datapoint was included in the sample (at least once)
+mean(is.element(1:10, s)) # proportion of original datapoints included in the bootstrap sample
+
+# Repeat this 1000 times for a dataset with 100 samples and record the proportions:
+props <- array(NA, c(1000, 1))
+for (i in 1:1000) { # imagine that each iteration of this loop is drawing the subsample of data for one tree in a random forest
+  props[i] <- mean(is.element(1:100, sample(100, replace = TRUE)))
+}
+hist(props)
+mean(props) # pretty close to 63.2%? the other 36.8% are then OOB.
+```
+
+## Fit a random forest with default parameters
+
+This RF is fit to all the variables, and it uses ntree=500 and mtry=floor(sqrt(20))=4 (we have 20 predictors). It's fitting classification trees, so the outputs of each tree are discrete (e.g., presence or absence). The final predictions are majority votes from the ensemble of trees, and the model output shows a confusion matrix for the out-of-bag data points.
+
+We'll use all 20 environmental variables in every model in this lab, so let's build the model formula once instead of typing out all 20 names each time. `reformulate()` pastes the names together with `+`:
+
+```{r}
+predVars <- names(envStack) # the 20 environmental variables
+rfFormula <- reformulate(predVars, response = "presAbsFact")
+rfFormula
+```
+
+```{r}
+set.seed(1234)
+model1 <- randomForest(rfFormula,
+                       data = trainData,
+                       importance = TRUE,  # compute importance values
+                       proximity = TRUE,   # compute proximity values
+                       keep.forest = TRUE) # keep the trees, so we can predict with them
+print(model1)
+```
+
+We can plot how the out of bag error rate changes as more trees are grown:
+
+```{r}
+plot(model1$err.rate[,1], xlab = "Number of trees fitted (iterations)", ylab = "OOB error rate")
+```
+
+We can use the predict function on the test data and evaluate. The default is that predictions from a forest of classification trees are discrete (present or absent):
+
+```{r}
+preds1pa <- predict(model1,
+                    testData[, predVars])
+confusionMatrix(as.factor(preds1pa), as.factor(testData$presAbs),
+                positive = "1") # treat presence ("1") as the positive class
+```
+
+If we ask (type='prob'), we can get numbers between 0 and 1 instead - the proportion of votes for presence among the trees. These scores are amenable to analysis with techniques like ROC curves as well.
+
+```{r}
+preds1prob <- predict(model1,
+                      type = 'prob',
+                      testData[, predVars])
+head(preds1prob) # one column per class: "0" (absence) and "1" (presence)
+ROCcurve <- roc(response = testData$presAbs,
+                predictor = preds1prob[, "1"])
+pROC::auc(ROCcurve)
+plot(ROCcurve)
+```
+
+We could also fit a random forest doing regression instead of classification, even though the response only has two values. You can do this just by using the numeric version of presAbs instead of presAbsFact. The warning it produces asks you to check whether you meant to do classification instead, but you can ignore it. This fits to minimize mean squared error between the 0/1 responses and the predictions, and the leaves of the trees contain numbers in [0,1] now.
+
+```{r}
+regrFormula <- reformulate(predVars, response = "presAbs") # same variables, numeric response
+set.seed(1234)
+modelRegr <- randomForest(regrFormula,
+                          data = trainData,
+                          importance = TRUE,  # compute importance values
+                          proximity = TRUE,   # compute proximity values
+                          keep.forest = TRUE)
+print(modelRegr)
+```
+
+We can compare the resulting models via AUC, among other options.
+
+```{r}
+predsRegrprob <- predict(modelRegr,
+                         testData[, predVars])
+ROCcurveRegr <- roc(response = testData$presAbs,
+                    predictor = predsRegrprob)
+pROC::auc(ROCcurveRegr)
+plot(ROCcurve)
+plot(ROCcurveRegr, col = "red", add = TRUE)
+
+legend('bottomright', c('classification RF', 'regression RF'), col = c('black', 'red'), lty = c(1, 1), lwd = c(2, 2))
+```
+
+## More trees
+
+Let's play with the parameters now. Here's a classification RF with 5000 trees instead of 500.
+
+```{r}
+set.seed(1234)
+model2 <- randomForest(rfFormula,
+                       data = trainData,
+                       ntree = 5000,
+                       importance = TRUE, # compute importance values
+                       proximity = TRUE)  # compute proximity values
+print(model2)
+```
+
+```{r}
+plot(model2$err.rate[,1], xlab = "Number of trees fitted (iterations)", ylab = "OOB error rate")
+```
+
+```{r}
+preds2pa <- predict(model2,
+                    testData[, predVars])
+confusionMatrix(as.factor(preds2pa), as.factor(testData$presAbs), positive = "1")
+```
+
+```{r}
+preds2prob <- predict(model2,
+                      type = 'prob',
+                      testData[, predVars])
+ROCcurve <- roc(response = testData$presAbs,
+                predictor = preds2prob[, "1"])
+pROC::auc(ROCcurve)
+plot(ROCcurve)
+```
+
+The results were very similar for 500 and 5000 trees. Here is the proportion of test points where the two forests predict the same class:
+
+```{r}
+mean(preds1pa == preds2pa)
+```
+
+## Varying mtry
+
+The mtry parameter influences the probability that a truly relevant variable will be in the subset considered at each split. If there are a small proportion of relevant variables, a higher mtry may be warranted. Let's try halving and doubling the default:
+
+```{r}
+set.seed(1234)
+model3 <- randomForest(rfFormula,
+                       data = trainData,
+                       ntree = 5000,
+                       mtry = 2,
+                       importance = TRUE, # compute importance values
+                       proximity = TRUE)  # compute proximity values
+print(model3)
+plot(model3$err.rate[,1], xlab = "Number of trees fitted (iterations)", ylab = "OOB error rate")
+preds3pa <- predict(model3, testData[, predVars])
+confusionMatrix(as.factor(preds3pa), as.factor(testData$presAbs), positive = "1")
+mean(preds2pa == preds3pa)
+```
+
+```{r}
+set.seed(1234)
+model4 <- randomForest(rfFormula,
+                       data = trainData,
+                       ntree = 5000,
+                       mtry = 8,
+                       importance = TRUE, # compute importance values
+                       proximity = TRUE)  # compute proximity values
+print(model4)
+plot(model4$err.rate[,1], xlab = "Number of trees fitted (iterations)", ylab = "OOB error rate")
+preds4pa <- predict(model4, testData[, predVars])
+confusionMatrix(as.factor(preds4pa), as.factor(testData$presAbs), positive = "1")
+mean(preds2pa == preds4pa)
+```
+
+Very little difference!
+
+## Variable importances
+
+One of the papers below referenced four variable importance measures; two are implemented in the randomForest package. The other two are described in Breiman's 2002 manual cited below and deal with the margin of the cases, which is the difference between the proportion of votes for its true class and the proportion of votes for the next best class (i.e., the amount the algorithm is getting this case correct by). I believe these were implemented in the Fortran code but are not in the R package. Here they are as a list:
+
+```{r}
+model2$importance
+```
+
+And as plots (run `?importance.randomForest` in the Console to read how they are computed):
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+varImpPlot(model2)
+```
+
+We can also make partial dependence plots to examine the relationship learned by the model for a variable (e.g., Mean Diurnal Range) and the species response. For a classification forest, `which.class` says which class to show; the default is the first level ("0", absence), so we ask for "1" (presence). The y-axis is on a logit scale: half the log-odds of the proportion of votes for presence.
+
+```{r}
+partialPlot(model2, trainData, x.var = "Mean.Diurnal.Range", which.class = "1")
+```
+
+## Visualize a proximity matrix
+
+Valavi et al (2021) discuss class overlap as an issue that affects performance in RFs. Proximity matrices are one way to visualize this. The proximity matrix reports the proportion of times each pair of data points falls into the same terminal node in a tree of the random forest. (By default, randomForest counts only the trees for which *both* points were out-of-bag, so the proximities are not inflated by trees that were trained on those points.) So, it is a similarity matrix with dimension nPoints x nPoints (here, the 500 training points). Here are the proximities for the first 5 x 5 = 25 pairs:
+
+```{r}
+model2$proximity[1:5, 1:5]
+```
+
+Note that the diagonal is 1: each point always falls into the same terminal node as itself.
+
+We can look at a 2-dimensional representation of the distance matrix given by (1 - proximity), where the colors are the two classes (presence and absence).
+
+```{r}
+#| fig-height: 6
+MDSplot(model2, fac = trainData$presAbsFact, palette = c("blue", "red"))
+legend("topright", c("presence", "absence"), col = c("red", "blue"), pch = 20)
+```
+
+## Visualize the predictive model
+
+If we give the full stack of rasters to the random forest, we can see the learned occurrence surface. With `type="prob"` the model returns one column per class, absence ("0") first and presence ("1") second, so `index = 2` keeps the probability of presence. (This takes a minute or so: 5000 trees, applied to about 109,000 land cells.)
+
+```{r}
+#| fig-width: 10
+#| fig-height: 4
+p <- predict(envStack, model2, type = "prob", index = 2, na.rm = TRUE)
+plot(c(pOccRaster, p), main = c('True Prob. of Occurrence', 'RF prediction'),
+     range = c(0, 1))
+```
+
+## Abundance modeling
+
+Random forests can also work on real-valued (e.g., abundance) data. Let's simulate some and try it out.
+
+```{r}
+intercept <- 2
+beta1 <- 0.5
+beta2 <- -0.5
+beta3 <- 0.25
+beta4 <- -0.05
+beta5 <- -0.2
+lambdaRaster <- exp(intercept +
+                  beta1 * scale(envStack$Mean.Diurnal.Range) +
+                  beta2 * scale(envStack$Isothermality) +
+                  beta3 * scale(envStack$Mean.Temperature.of.Wettest.Quarter) +
+                  beta4 * scale(envStack$Mean.Diurnal.Range)^2 + # quadratic term
+                  beta5 * scale(envStack$Isothermality) * scale(envStack$Mean.Temperature.of.Wettest.Quarter)) # interaction term
+names(lambdaRaster) <- "lambda"
+
+plot(lambdaRaster)
+```
+
+```{r}
+#| fig-height: 6
+# get the mean abundances that correspond to the points we selected:
+lambdas <- extract(lambdaRaster, simPts[, c("x", "y")], ID = FALSE)$lambda
+
+# sample from these means (again with a new seed, different from the ones used above):
+set.seed(2468)
+abund <- rpois(n = nPoints, lambda = lambdas) # sampling from a Poisson instead of binomial now
+trainAbund <- abund[1:(nPoints/2)]
+testAbund <- abund[(nPoints/2+1):nPoints]
+# put response and variables together in a data.frame:
+abundDF <- cbind(abund = trainAbund, trainData[, predVars])
+
+# plot the three relevant climate variables and the mean abundance surface
+plot(c(envStack$Mean.Diurnal.Range,
+       envStack$Isothermality,
+       envStack$Mean.Temperature.of.Wettest.Quarter,
+       lambdaRaster),
+     main = c('Mean.Diurnal.Range', 'Isothermality',
+              'Mean.Temperature.of.Wettest.Quarter', 'Mean Abundance'))
+```
+
+Note that these data are generated from a Poisson distribution, but the random forest is not considering this. In some sense, it's treating them as Gaussian, since it's measuring error with MSE. For regression, the default mtry=floor(20/3)=6.
+
+The tic() and toc() calls are timing how long it takes to train this RF, because in a moment we'll check out a faster implementation for you to compare against.
+
+```{r}
+abundFormula <- reformulate(predVars, response = "abund")
+set.seed(1234)
+tic("randomForest RF")
+model5 <- randomForest(abundFormula,
+                       data = abundDF,
+                       ntree = 1000,
+                       importance = TRUE) # compute importance values
+toc()
+print(model5)
+```
+
+Now, OOB estimates are of MSE instead of misclassification rate.
+
+```{r}
+plot(model5$mse, xlab = "Number of trees fitted (iterations)", ylab = "OOB MSE")
+```
+
+We can compare against the MSE on predictions for the independent test set.
+
+```{r}
+preds5 <- predict(model5, testData[, predVars])
+mean((preds5 - testAbund)^2)
+```
+
+We can look at variable importance with similar measures.
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+model5$importance
+varImpPlot(model5)
+```
+
+## The ranger package
+
+Valavi et al (2021) suggest the R package 'ranger' has a fast implementation of RFs, whereas we have used 'randomForest' package above. Let's check out this package briefly too.
+
+```{r}
+tic("ranger RF")
+rangerModel <- ranger(abundFormula,
+                      data = abundDF,
+                      num.trees = 1000, # the name of this parameter is different from randomForest
+                      importance = 'permutation', # importance is not TRUE/FALSE but different types (see help page)
+                      seed = 1234) # ranger takes its seed as an argument
+toc()
+print(rangerModel)
+```
+
+It is faster! (Two of ranger's defaults differ from randomForest's: it uses all of your computer's processor cores at once, which is part of why it's faster, and its default mtry is floor(sqrt(20))=4 for regression as well as classification.)
+
+I don't see an easy way to make the plots of OOB error against num.trees in this package. We would have to find our own way to back this info out of the process, I think. (Let me know if you find an easy way!)
+
+The test MSE is very similar to the other implementation.
+
+```{r}
+predsRanger <- predict(rangerModel, testData[, predVars])
+mean((predsRanger$predictions - testAbund)^2)
+```
+
+And the importance values are similar, too.
+
+```{r}
+sort(rangerModel$variable.importance, decreasing = TRUE)
+```
+
+I'm also not seeing functionality for partial dependence plots built into 'ranger'. We could look at a separate package for these, like 'pdp'. For example, `pdp::partial()` works with ranger models (and many other model types). It needs the training data to average over:
+
+```{r}
+pdRanger <- partial(rangerModel, pred.var = "Mean.Diurnal.Range", train = abundDF)
+plotPartial(pdRanger)
+```
+
+::: {.callout-important title="Exercise"}
+Choose any aspect of RFs that you are curious about and explore it further. Report briefly on your motivation, design of your experiment, results, and conclusions. To play with changing the sampling of the classes, I think you will manipulate the sample.fraction parameter in ranger or the sampsize parameter in randomForest.
+:::
+
+# Turn in
+
+**(a Canvas discussion post, by the due date on Canvas)** Please post to the online discussion of this lab. Please include brief descriptions of your exploration of the exercise, with any relevant plots. Please also include, if applicable:
+
+* Any key take-aways from this lab that you want to remember for any future projects you may conduct in which you use species distribution models.
+* Any remaining questions or confusions do you have that you might like to learn more about.
+
+# Further Resources
+
+Evans, J. S., Murphy, M. A., Holden, Z. A., & Cushman, S. A. (2010). Modeling Species Distribution and Change Using Random Forest. In Predictive Species and Habitat Modeling in Landscape Ecology: Concepts and Applications (pp. 139–159). [doi](https://doi.org/10.1007/978-1-4419-7390-0_8)
+
+Cutler, D. R., Edwards, T. C., Jr., Beard, K. H., Cutler, A., Hess, K. T., Gibson, J., & Lawler, J. J. (2007). Random Forests for Classification in Ecology. Ecology, 88(11), 2783-2792. [doi](https://doi.org/10.1890/07-0539.1)
+
+Prasad, A. M., Iverson, L. R., & Liaw, A. (2006). Newer classification and regression tree techniques: Bagging and random forests for ecological prediction. Ecosystems, 9(2), 181-199.
+
+Liaw, A., & Wiener, M. (2002). Classification and Regression by randomForest. R News, 2(3), 18-22.
+
+Breiman, L. [Manual on setting up, using, and understanding random forests v3.1](https://www.stat.berkeley.edu/~breiman/Using_random_forests_V3.1.pdf), 2002.
+
+Valavi, R., Elith, J., Lahoz-Monfort, J. J., & Guillera-Arroita, G. (2021). Modelling species presence-only data with random forests. Ecography, 44, 1731-1742. [doi](https://doi.org/10.1111/ecog.05615)
+
+Technical statistical foundations:
+Breiman, L. (2001). Random forests. Machine Learning, 45(1), 5-32. [doi](https://doi.org/10.1023/A:1010933404324)

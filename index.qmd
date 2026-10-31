@@ -1,0 +1,63 @@
+---
+pagetitle: "Machine Learning in Species Distribution Modeling"
+toc: false
+---
+
+::: {.hero}
+::: {.kicker}
+Oregon State University · FW 532 · Fall 2026
+:::
+
+# Machine Learning in Species Distribution Modeling
+
+::: {.lede}
+Where do species live, and why? This course explores machine learning methods for building and evaluating species distribution models (SDMs), through readings, discussion, and hands-on labs in **R** or **Python**.
+:::
+:::
+
+::: {.card-grid}
+[[Get set up]{.tile-title} [Install R or Python, download the starter kit, and run your first lab.]{.tile-body}](setup.qmd){.tile}
+
+[[Labs]{.tile-title} [Six core labs plus a bonus lab and demos. Each one has an overview, an R version, and a Python version.]{.tile-body}](labs/index.qmd){.tile}
+
+[[Syllabus & schedule]{.tile-title} [Weekly topics, readings, and when each lab is due.]{.tile-body}](schedule.qmd){.tile}
+
+[[Readings]{.tile-title} [The papers we discuss each week, with links.]{.tile-body}](readings.qmd){.tile}
+:::
+
+## About the course
+
+SDMs link geolocated observations of a species to the environmental conditions where it was found. They're used to map ranges, plan surveys and reserves, and project responses to climate change. The course starts with an overview of species distribution modeling, types of data, and the assumptions behind common approaches. The second module covers model evaluation: how to define and measure success for an SDM. We then work through machine-learning methods that are widely used in SDM, including classification and regression trees, random forests, boosted regression trees, and Maxent. The rest of the course explores further topics, often chosen with student input, and centers on student projects.
+
+The analysis techniques often carry over to analogous problems in other fields. If you're wondering whether the course fits your interests, get in touch with the instructor.
+
+## How the labs work
+
+```{mermaid}
+%%| fig-width: 6.5
+flowchart LR
+  E["Real climate &<br/>elevation layers"] --> S["Simulate a<br/>virtual species"]
+  S --> F["Fit a model<br/>(GLM, CART, RF,<br/>BRT, Maxent, …)"]
+  F --> V["Evaluate:<br/>metrics, CV,<br/>maps, effects"]
+  V -. "compare with<br/>the known truth" .-> S
+```
+
+* **Virtual species.** Most labs invent a species from real WorldClim climate layers, so we *know* the true answer and can check how well each method recovers it.
+* **One shared dataset.** Every lab, in both languages, reads the same file of 20 environmental layers for North America.
+* **R or Python, your choice.** Each lab comes in two parallel versions that do the same analysis step by step. The R track uses current packages (`terra`, `randomForest`, `gbm`, `maxnet`, …). The Python track is written for beginners and uses `numpy`, `pandas`, `scikit-learn`, and `statsmodels`. Python notebooks also run on Google Colab with nothing to install.
+* **Explore, then report.** Each lab ends with open-ended exercises. You'll share what you found in a Canvas discussion post.
+
+## Learning outcomes
+
+By the end of the course, you should be able to:
+
+1. Characterize the strengths and limitations of the machine learning techniques covered in the course for the task of species distribution modeling.
+2. Analyze trade-offs and choices in the process of building a species distribution model with these techniques, with respect to a set of analysis goals.
+3. Construct a species distribution model using the techniques covered in the course.
+4. Design, implement, and evaluate an appropriate species distribution modeling method for a real-world problem and dataset.
+
+## Instructor
+
+Prof. Rebecca Hutchinson · [ML QuESt Lab](https://hutchinson-lab.github.io/) · Office hours by appointment.
+
+Course logistics, submissions, and grades are on **Canvas**. This website holds the lab materials.

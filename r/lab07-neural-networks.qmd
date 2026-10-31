@@ -1,0 +1,350 @@
+---
+title: "Bonus Lab 7: Artificial Neural Networks (ANN)"
+subtitle: "FW 532 · R version"
+---
+
+*This is an optional (bonus) lab that goes with the neural networks lecture.*
+
+**Goals:**
+
+* To understand how neural network models are built and interpreted in R.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* R packages: terra, neuralnet, pROC, here (run `source("install_packages.R")` once to install everything for the term)
+* Open `fw532.Rproj` first, so that `here()` finds the data (see Lab 1).
+
+# Setup
+
+```{r}
+#| message: false
+library(terra)      # rasters (gridded maps)
+library(neuralnet)  # neural networks
+library(pROC)       # AUC
+library(here)       # file paths relative to the project folder
+
+envStack <- rast(here("data", "envStack.tif"))
+```
+
+# Generate Data
+
+```{r}
+# define logistic function
+logistic <- function(x) {exp(x) / (1 + exp(x))}
+
+# here's the scaling: standardize every layer once (mean 0, sd 1 over all cells)
+scaledStack <- scale(envStack)
+
+# get points (from the scaled stack, so the data are already scaled)
+nPoints <- 1000
+set.seed(1234)
+simPts <- spatSample(scaledStack, size = nPoints, method = "random",
+                     na.rm = TRUE, xy = TRUE)
+
+# set parameters
+#intercept <- -1.5
+#beta1 <- -2
+#beta2 <- -1.5
+#beta3 <- 1.5
+#pOccRaster <- logistic(intercept +
+#                  beta1 * scaledStack$Precipitation.Seasonality +
+#                  beta2 * scaledStack$Min.Temperature.of.Coldest.Month +
+#                  beta3 * scaledStack$Mean.Temperature.of.Wettest.Quarter)
+
+intercept <- -0.25
+beta1 <- -1
+beta2 <- 1
+beta3 <- 1.5
+beta4 <- 1
+beta5 <- -1
+pOccRaster <- logistic(intercept +
+                  beta1 * scaledStack$Mean.Diurnal.Range +
+                  beta2 * scaledStack$Isothermality +
+                  beta3 * scaledStack$Mean.Temperature.of.Wettest.Quarter +
+                  beta4 * scaledStack$Mean.Diurnal.Range^2 + # quadratic term
+                  beta5 * scaledStack$Isothermality * scaledStack$Mean.Temperature.of.Wettest.Quarter) # interaction term
+names(pOccRaster) <- "pOcc"
+
+# get the values that correspond to the points we selected:
+pOccs <- extract(pOccRaster, simPts[, c("x", "y")], ID = FALSE)$pOcc
+
+# sample from these probabilities (with a different seed -- see Lab 1):
+set.seed(5678)
+presAbs <- rbinom(n = nPoints, size = 1, prob = pOccs)
+
+# put response and variables together in a data.frame:
+modelingDF <- cbind(presAbs, simPts)
+
+# plot the result
+plot(pOccRaster)
+points(simPts$x[presAbs == 0], simPts$y[presAbs == 0], col = "blue", pch = 20)
+points(simPts$x[presAbs == 1], simPts$y[presAbs == 1], col = "red", pch = 20)
+
+# split into training and test
+# (spatSample() returns the points in random order, so this is a random split)
+trainData <- modelingDF[1:(nPoints/2), ]
+testData <- modelingDF[(nPoints/2 + 1):nPoints, ]
+```
+
+::: {.callout-note collapse="true" title="Why scale the whole stack once?"}
+Neural networks are sensitive to the scale of their inputs, so we standardize every variable. It matters that the *same* standardization is used everywhere. A tempting shortcut is to standardize the 1,000 sampled points with their own means and SDs, and later standardize the grid of all cells with the grid's means and SDs. The two sets of means and SDs differ slightly, so the map would be predicted from inputs on a slightly different scale than the ones the model was trained on. Scaling the raster stack once, then sampling the training data from it and predicting onto it, avoids that problem: a value of 1.2 for a variable means the same thing in training and in prediction.
+:::
+
+We'll make predictions for every cell and map them back to geographic space to visualize models. The neuralnet models don't operate directly on rasters as some other methods do, but terra's `predict()` takes care of that for us: it hands the values of the cells to the model's own `predict()` function as a data.frame (a block of cells at a time) and puts the predictions back onto the map. Because we predict onto `scaledStack`, the map inputs are scaled exactly like the training data.
+
+Most of our models use all 20 variables, so we'll write the formula once and reuse it:
+
+```{r}
+predVars <- names(envStack)
+nnFormula <- reformulate(predVars, response = "presAbs")
+nnFormula
+```
+
+# Neural Networks
+
+## Fit with default parameters
+
+Let's start with a basic model - all variables, default parameters. We'll give a formula and some data. Specifying `linear.output = FALSE` tells the model we want probabilistic outputs, so the final results are put through that sigmoid/logistic function before returning predictions. We DO need to specify the network architecture with the `hidden` parameter - let's arbitrarily start with one layer of six hidden units. You can also experiment with more layers - e.g. `hidden = c(8, 4)` constructs a network with 8 hidden units in the first layer and 4 hidden units in the second layer. We're using `set.seed()` here to get consistent results across runs since the weight parameters in neural nets are initialized to random numbers at the beginning of the training process (neuralnet draws them from a standard normal distribution). We use the same seed before every network, so networks with the same architecture start from the same weights, and differences between models come from the settings we change rather than from a lucky or unlucky start.
+
+```{r}
+#| fig-height: 8
+set.seed(2025)
+model1 <- neuralnet(nnFormula,
+                    data = trainData,
+                    hidden = c(6),
+                    linear.output = FALSE)
+plot(model1, rep = "best")
+```
+
+(`rep = "best"` draws the network in the usual plot window; without it, neuralnet's `plot()` opens a new window.)
+
+::: {.callout-warning collapse="true" title="If you see \"Algorithm did not converge\""}
+neuralnet keeps updating the weights until the stopping rule is met (see *Early stopping* below) or until it has taken `stepmax` steps (100,000 by default). If it hits `stepmax` first, it warns "Algorithm did not converge in 1 of 1 repetition(s) within the stepmax" and returns a model with no weights, so `plot()` and `predict()` fail. Whether a network converges in time depends on its random starting weights. For example, with `set.seed(1234)` instead of `set.seed(2025)`, `model1` does not converge within 100,000 steps, which is why we use 2025 here. If it happens to you while exploring, you can raise `stepmax` (e.g., `stepmax = 1e6`; slower), try another seed, use fewer hidden units, or loosen `threshold`.
+:::
+
+How well does this model predict the test observations? Let's measure with AUC for now.
+
+```{r}
+preds1train <- predict(model1, trainData[, predVars])
+auc(roc(response = as.factor(trainData$presAbs), predictor = as.vector(preds1train)))
+
+preds1test <- predict(model1, testData[, predVars])
+auc(roc(response = as.factor(testData$presAbs), predictor = as.vector(preds1test)))
+```
+
+Training AUC is substantially better than test AUC.
+
+## Visualize the predictive model
+
+We will also want to look at our predictions in geographic space as we experiment with these models.
+
+```{r}
+#| fig-height: 3.5
+# predict for all cells
+predRaster <- predict(scaledStack, model1, na.rm = TRUE)
+
+# plot next to the truth
+plot(c(pOccRaster, predRaster), main = c("True Prob. of Occurrence", "NN prediction"),
+     range = c(0, 1))
+```
+
+## Model Tuning
+
+The basic model above looks overfit! Evidence of this: 1) some pretty large magnitude weights for variables ~N(0,1) and hidden units using the sigmoid/logistic activation (i.e. outputs in [0,1]) - imagine getting regression coefficients (i.e. betas) of 50 with standardized inputs; 2) big gap between training set and testing set performance; 3) extreme predictions across the geographic extent (i.e. lots of predictions near 0 (dark purple) and near 1 (yellow) in that map - see also `hist(predRaster)`).
+
+So, what to do about this? There are a few ways to influence the complexity of the neural net. We'll look at the network architecture, the input variables, and the number of iterations the fitting algorithm is run for.
+
+### Simpler architecture
+
+Let's halve the number of hidden units. This will take us from 20x6 parameters in the first layer to 20x3.
+
+```{r}
+#| fig-height: 8
+set.seed(2025)
+model2 <- neuralnet(nnFormula,
+                    data = trainData,
+                    hidden = c(3),
+                    linear.output = FALSE)
+plot(model2, rep = "best")
+```
+
+```{r}
+preds2train <- predict(model2, trainData[, predVars])
+auc(roc(response = as.factor(trainData$presAbs), predictor = as.vector(preds2train)))
+
+preds2test <- predict(model2, testData[, predVars])
+auc(roc(response = as.factor(testData$presAbs), predictor = as.vector(preds2test)))
+```
+
+```{r}
+#| fig-height: 3.5
+# predict for all cells
+predRaster <- predict(scaledStack, model2, na.rm = TRUE)
+
+# plot next to the truth
+plot(c(pOccRaster, predRaster), main = c("True Prob. of Occurrence", "NN prediction"),
+     range = c(0, 1))
+```
+
+Some improvement!
+
+### Fewer variables
+
+Another option would be to reduce the set of input variables. Let's remove a bunch of the precipitation variables, which are all correlated with each other anyway. Here, we'll go back to 6 hidden units again (changing one thing at a time), but we've still reduced the number of parameters, now from 20x6 to 13x6. (This time we write the formula out, so you can see which variables were removed. The three variables marked "true" are the ones we used to simulate the species.)
+
+```{r}
+#| fig-height: 8
+set.seed(2025)
+model3 <- neuralnet(presAbs ~ Annual.Mean.Temperature +
+                      Mean.Diurnal.Range +                  # true
+                      Isothermality +                       # true
+                      Temperature.Seasonality +
+                      Max.Temperature.of.Warmest.Month +
+                      Min.Temperature.of.Coldest.Month +
+                      Temperature.Annual.Range +
+                      Mean.Temperature.of.Wettest.Quarter + # true
+                      #Mean.Temperature.of.Driest.Quarter +
+                      Mean.Temperature.of.Warmest.Quarter +
+                      #Mean.Temperature.of.Coldest.Quarter +
+                      Annual.Precipitation +
+                      #Precipitation.of.Wettest.Month +
+                      #Precipitation.of.Driest.Month +
+                      Precipitation.Seasonality +
+                      Precipitation.of.Wettest.Quarter +
+                      #Precipitation.of.Driest.Quarter +
+                      #Precipitation.of.Warmest.Quarter +
+                      #Precipitation.of.Coldest.Quarter +
+                      elevation,
+                    data = trainData,
+                    hidden = c(6),
+                    linear.output = FALSE)
+plot(model3, rep = "best")
+```
+
+```{r}
+preds3train <- predict(model3, trainData[, predVars])
+auc(roc(response = as.factor(trainData$presAbs), predictor = as.vector(preds3train)))
+
+preds3test <- predict(model3, testData[, predVars])
+auc(roc(response = as.factor(testData$presAbs), predictor = as.vector(preds3test)))
+```
+
+```{r}
+#| fig-height: 3.5
+# predict for all cells
+predRaster <- predict(scaledStack, model3, na.rm = TRUE)
+
+# plot next to the truth
+plot(c(pOccRaster, predRaster), main = c("True Prob. of Occurrence", "NN prediction"),
+     range = c(0, 1))
+```
+
+In this case, it looks like reducing the number of variables is not as effective as reducing the number of hidden units in mitigating overfitting.
+
+### Early stopping
+
+Neural nets are trained with an iterative algorithm that continually updates the weight parameters in the network. The longer it runs, the more it can adjust the parameters to fit the training set better and better. The algorithm stops when some stopping criterion is reached. This can be controlled by the `threshold` parameter in neuralnet. When the partial derivatives of the error function drop below the threshold, the algorithm stops. The default is 0.01. Let's try 0.1 instead. This will cut the process off earlier and produce a simpler model, which we may hope will generalize better. (Because `model4` has the same architecture and seed as `model1`, it starts from the same weights and follows the same path: it is literally `model1`'s training run, stopped earlier. Compare the number of steps each one took.)
+
+```{r}
+#| fig-height: 8
+set.seed(2025)
+model4 <- neuralnet(nnFormula,
+                    data = trainData,
+                    hidden = c(6),
+                    linear.output = FALSE,
+                    threshold = 0.1)
+plot(model4, rep = "best")
+
+# number of training steps taken by model1 and model4
+c(model1 = model1$result.matrix["steps", 1], model4 = model4$result.matrix["steps", 1])
+```
+
+```{r}
+preds4train <- predict(model4, trainData[, predVars])
+auc(roc(response = as.factor(trainData$presAbs), predictor = as.vector(preds4train)))
+
+preds4test <- predict(model4, testData[, predVars])
+auc(roc(response = as.factor(testData$presAbs), predictor = as.vector(preds4test)))
+```
+
+```{r}
+#| fig-height: 3.5
+# predict for all cells
+predRaster <- predict(scaledStack, model4, na.rm = TRUE)
+
+# plot next to the truth
+plot(c(pOccRaster, predRaster), main = c("True Prob. of Occurrence", "NN prediction"),
+     range = c(0, 1))
+```
+
+# Model Interpretation
+
+Supposing we've found a model whose fit we're satisfied with, we may want to understand more about the relationships of inputs to outputs.
+
+The neuralnet package provides a function `gwplot()` to plot the 'generalized weights' for the network. In the example plot below for Isothermality, there is a point for each data point in the training dataset.
+
+```{r}
+gwplot(model4, selected.covariate = "Isothermality")
+```
+
+The documentation refers to Intrator & Intrator (2001) (full citation below). That paper states: "in neural network modeling, the generalized weights have the same interpretation as weights have in logistic regression, i.e., the contribution to the log odds. However, unlike logistic regression, this contribution is local at each specific point x. The dependence of the generalized weights on the specific covariate levels attests to the non-linearity of the ANN model, even with respect to the log-odds. For example, it is possible that the same variable may have a positive effect for some of the observations and a negative effect for others and its average effect may be close to zero. The distribution of the generalized weights, over all the data shows whether a certain variable has an overall strong effect, and determines if the effect is linear or not. A small variance of the distribution suggests that the effect is linear. A large variance suggests that the effect is non-linear as it varies over the observation space. In contrast, in logistic regression the respective distribution is concentrated at one value." I don't have great intuition for this yet - please share if you have insight on these plots!
+
+::: {.callout-note collapse="true" title="What exactly is a generalized weight?"}
+For variable $x_i$ at a data point $x$, the generalized weight is the slope of the predicted log-odds with respect to that variable, holding the other inputs fixed:
+$\tilde w_i(x) = \partial \log\big(\hat p(x) / (1 - \hat p(x))\big) / \partial x_i$.
+Here the inputs are standardized, so it is the change in log-odds per standard deviation of Isothermality. In a logistic regression this slope would be the same number ($\beta_i$) everywhere. Because we simulated these data, we know the true slope too: the true log-odds contain $\beta_2 \cdot \text{Isothermality} + \beta_5 \cdot \text{Isothermality} \times \text{Mean.Temperature.of.Wettest.Quarter}$, so the true generalized weight for Isothermality is $\beta_2 + \beta_5 \cdot \text{Mean.Temperature.of.Wettest.Quarter}$, which changes from point to point.
+:::
+
+## Permutation tests
+
+One of the variable importance measures from random forests worked by permuting variables, thus breaking the connection between the variable and the response, and measuring the effect on performance. This is a general strategy that can be used for any model. Here's a start at how to look at this.
+
+```{r}
+# set up a vector to record the training set AUC when each variable is permuted
+permutedAUCs <- vector("numeric", length(predVars))
+names(permutedAUCs) <- predVars
+
+set.seed(2468)
+for (v in predVars) {
+  # make a copy of the data
+  permData <- trainData
+  # permute the variable's observed values
+  permData[, v] <- sample(permData[, v])
+  # make predictions on the modified dataset
+  preds4perm <- predict(model4, permData[, predVars])
+  # record the resulting AUC (quiet = TRUE hides pROC's messages)
+  permutedAUCs[v] <- auc(roc(response = as.factor(trainData$presAbs),
+                             predictor = as.vector(preds4perm), quiet = TRUE))
+}
+
+# without any permutation, we have a baseline for the AUC
+preds4train <- predict(model4, trainData[, predVars])
+print(paste("Base training AUC:",
+            round(auc(roc(response = as.factor(trainData$presAbs),
+                          predictor = as.vector(preds4train), quiet = TRUE)), digits = 3)))
+
+sort(round(permutedAUCs, digits = 3), decreasing = FALSE)
+```
+
+For any given variable, you could turn this into a statistical test by permuting it many times and repeating the process above. This would give you an empirical distribution of the null hypothesis that the variable has no effect on the response. Then you could look at how different the performance is when the variable IS included (the base training AUC above).
+
+::: {.callout-important title="Exercise"}
+Play! Can you find a network structure that works better? Can you imagine using cross-validation to tune aspects of the network structure? Are you satisfied with the permutation importance approach, or do you want to try building a null distribution for a variable or two?
+:::
+
+# Turn in
+
+**(a Canvas discussion post, by the due date on Canvas)** Please post to the online discussion of this lab. Please include brief descriptions of your exploration of the exercise, with any relevant plots. Please also include, if applicable:
+
+* Any key take-aways from this lab that you want to remember for any future projects you may conduct in which you use species distribution models.
+* Any remaining questions or confusions do you have that you might like to learn more about.
+
+# Further Resources
+
+[Online book: *Neural Networks and Deep Learning*](http://neuralnetworksanddeeplearning.com/index.html) (Michael Nielsen)
+
+Lek, S., & Guégan, J. F. (1999). Artificial neural networks as a tool in ecological modelling, an introduction. *Ecological Modelling*, 120, 65–73.
+
+Generalized weights in ANNs:
+Intrator, O., & Intrator, N. (2001). Interpreting neural-network results: a simulation study. *Computational Statistics & Data Analysis*, 37, 373–393.

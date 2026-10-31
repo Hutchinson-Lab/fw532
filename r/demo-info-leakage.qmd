@@ -1,0 +1,197 @@
+---
+title: "Demo: Information Leakage"
+subtitle: "FW 532 · R version"
+---
+
+Setup.
+
+```{r}
+#| message: false
+#| warning: false
+library(terra)    # rasters (gridded maps)
+library(ggplot2)
+library(pROC)     # ROC curves and AUC
+library(ape)      # Moran's I
+library(here)     # file paths relative to the project folder
+
+envStack <- rast(here("data", "envStack.tif"))
+```
+
+Generate a new raster variable which is precipitation seasonality plus noise in the south (highly correlated) and random noise in the north. The north/south boundary is latitude 45.
+
+```{r}
+#| fig-height: 4
+noiseRast <- envStack$Precipitation.Seasonality
+set.seed(2023)
+noiseRast <- setValues(noiseRast, rnorm(n = ncell(noiseRast)))
+noiseRast <- mask(noiseRast, mask = envStack$Precipitation.Seasonality)
+simRast <- envStack$Precipitation.Seasonality + noiseRast
+
+northExt <- ext(xmin(envStack), xmax(envStack), 45, ymax(envStack))
+southExt <- ext(xmin(envStack), xmax(envStack), ymin(envStack), 45)
+northRast <- crop(simRast, northExt) - crop(envStack$Precipitation.Seasonality, northExt) # = just the noise
+southRast <- crop(simRast, southExt)
+newVar <- merge(northRast, southRast)
+newStack <- c(envStack$Precipitation.Seasonality, newVar)
+names(newStack) <- c("Precipitation.Seasonality", "simRast")
+plot(newStack)
+```
+
+Sample data from the south. Generate a species that responds to precipitation seasonality.
+
+```{r}
+logistic <- function(x) { 1 / (1 + exp(-x)) }
+
+# get points
+nPoints <- 1000
+#nPoints = 3000
+set.seed(1234)
+simPts <- spatSample(southRast, size = nPoints, method = "random",
+                     na.rm = TRUE, xy = TRUE)
+latLongs <- simPts[, c("x", "y")]
+
+# scale the climate variables:
+scaledEnv <- extract(newStack, latLongs, ID = FALSE)
+scaledEnv[, 1:2] <- apply(scaledEnv[, 1:2], 2, scale)
+
+# set parameters
+intercept <- -1.5
+beta1 <- -1.5
+pOccRaster <- logistic(intercept +
+                         beta1 * scale(newStack$Precipitation.Seasonality))
+names(pOccRaster) <- "pOcc"
+
+# get the values that correspond to the points we selected:
+pOccs <- extract(pOccRaster, latLongs, ID = FALSE)$pOcc
+
+# sample from these probabilities (a *different* seed for a different random step; see Lab 1):
+set.seed(5678)
+presAbs <- rbinom(n = nPoints, size = 1, prob = pOccs)
+
+# put response and variables together in a data.frame:
+modelingDF <- data.frame(presAbs, scaledEnv, latLongs)
+
+# plot the result
+plot(pOccRaster)
+points(modelingDF$x[modelingDF$presAbs == 0], modelingDF$y[modelingDF$presAbs == 0], col = "blue", pch = 20)
+points(modelingDF$x[modelingDF$presAbs == 1], modelingDF$y[modelingDF$presAbs == 1], col = "red", pch = 20)
+```
+
+Split these data randomly in half for training and testing. Fit a model to the WRONG variable - the simulated raster that is correlated with precipitation seasonality in the south.
+
+```{r}
+trainData <- modelingDF[1:floor(nPoints/2), ]
+testData <- modelingDF[(floor(nPoints/2) + 1):nPoints, ]
+
+modelNew <- glm(formula = presAbs ~ simRast,
+                data = trainData,
+                family = "binomial")
+
+modelNew
+```
+
+Predict on the randomly withheld (southern) test data.
+
+```{r}
+predProbs <- predict(modelNew,
+                     testData,
+                     type = "response")
+
+resids <- abs(predProbs - testData$presAbs)
+p <- ggplot(data = data.frame(resids, x = testData$x, y = testData$y),
+            mapping = aes(x = x, y = y, col = resids)) +
+  geom_point() +
+  scale_color_continuous(low = "white", high = "red") +
+  coord_quickmap()
+p
+```
+
+Test residuals for spatial autocorrelation - reject the null that there is none.
+
+```{r}
+resid.dists <- as.matrix(dist(cbind(testData$x, testData$y))) # distances in degrees of longitude/latitude
+resid.dists.inv <- 1/resid.dists
+diag(resid.dists.inv) <- 0
+Moran.I(resids, resid.dists.inv)
+```
+
+Look at ROC on the random test holdout.
+
+```{r}
+# create an ROC object for these data:
+ROCcurve <- roc(response = testData$presAbs, predictor = predProbs)
+plot(ROCcurve) # plot it
+plot(smooth(ROCcurve), add = TRUE, col = "blue") # add a smoothed version
+# make a confidence interval object for the curve (by bootstrapping, so set a seed):
+set.seed(1111)
+curveCI <- ci(ROCcurve, of = "thresholds")
+plot(curveCI, col = "grey") # plot it with grey error bars
+```
+
+```{r}
+auc(ROCcurve) # get the area under the curve
+ci(ROCcurve) # get a confidence interval for the AUC
+```
+
+Now sample some points in the north, where the variables are NOT correlated.
+
+```{r}
+set.seed(4321)
+newPts <- spatSample(northRast, size = nPoints, method = "random",
+                     na.rm = TRUE, xy = TRUE)
+latLongs <- newPts[, c("x", "y")]
+
+# scale the climate variables:
+scaledEnv <- extract(newStack, latLongs, ID = FALSE)
+scaledEnv[, 1:2] <- apply(scaledEnv[, 1:2], 2, scale)
+
+# set parameters
+intercept <- -1.5
+beta1 <- -1.5
+pOccRaster <- logistic(intercept +
+                         beta1 * scale(newStack$Precipitation.Seasonality))
+names(pOccRaster) <- "pOcc"
+
+# get the values that correspond to the points we selected:
+pOccs <- extract(pOccRaster, latLongs, ID = FALSE)$pOcc
+
+# sample from these probabilities:
+set.seed(8765)
+presAbs <- rbinom(n = nPoints, size = 1, prob = pOccs)
+
+# put response and variables together in a data.frame:
+modelingDF <- data.frame(presAbs, scaledEnv, latLongs)
+
+# plot the result
+plot(pOccRaster)
+points(modelingDF$x[modelingDF$presAbs == 0], modelingDF$y[modelingDF$presAbs == 0], col = "blue", pch = 20)
+points(modelingDF$x[modelingDF$presAbs == 1], modelingDF$y[modelingDF$presAbs == 1], col = "red", pch = 20)
+```
+
+Predict values in the north based on the model fit in the south.
+
+```{r}
+newPreds <- predict(modelNew,
+                    modelingDF,
+                    type = "response")
+ROCcurveNEW <- roc(response = modelingDF$presAbs, predictor = newPreds)
+plot(ROCcurveNEW) # plot it
+plot(smooth(ROCcurveNEW), add = TRUE, col = "blue") # add a smoothed version
+# make a confidence interval object for the curve:
+set.seed(2222)
+curveCINEW <- ci(ROCcurveNEW, of = "thresholds")
+plot(curveCINEW, col = "grey") # plot it with grey error bars
+auc(ROCcurveNEW) # get the area under the curve
+ci(ROCcurveNEW) # get a confidence interval for the AUC
+```
+
+Compare the curves.
+
+```{r}
+plot(ROCcurve) # plot it
+plot(ROCcurveNEW, add = TRUE, col = "red")
+legend("bottomright", c("South: rand. holdout", "North: independent/new data"),
+       col = c("black", "red"), lty = c(1, 1), lwd = c(2, 2))
+```
+
+So we have identified a case where a model looked decent on holdout data but transferred very poorly to a new location. But it was a contrived example, and I don't think that blockCV or similar would have detected the problem. How can we make this example 1) more realistic, and 2) something that can be addressed with a smarter approach to model evaluation???

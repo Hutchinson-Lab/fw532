@@ -1,0 +1,192 @@
+---
+title: "Lab 2: Evaluation: Metrics and Cross-Validation"
+subtitle: "How good is a model? It depends on what you measure, and on which data"
+description: "Score a slightly wrong model of a virtual species with confusion-matrix metrics, ROC and precision-recall curves, then see how resubstitution, random, spatial, and k-fold cross-validation change the verdict."
+image: images/lab02.png
+order: 2
+---
+
+::: {.lab-meta}
+[Weeks 1–2]{} [Readings: Liu, White & Newell (2011); Roberts et al. (2017)]{} [Methods: evaluation metrics, ROC/PR curves, cross-validation]{} [R · Python]{}
+:::
+
+## Why this lab?
+
+In Lab 1 we could check a model against the truth because we invented the species. Real data never come with an answer key. Instead, we judge a model by how well its predictions agree with observations it hasn't seen. That involves two separate design choices, and both can change the verdict.
+
+**What to measure.** An SDM usually outputs a probability or score at each site, while the data are 0s and 1s. There are many ways to summarize how well they agree. Some reward finding the presences, some reward getting the absences right, some reward ranking sites in the right order, and some reward getting the probabilities themselves right. The right choice depends on what the map will be used for. Missing a real population costs something different from sending a survey crew to an empty site.
+
+**Which data to measure it on.** Scoring a model on the data it was fit to (*resubstitution*) flatters it. Even a random hold-out can flatter it, because nearby sites tend to be alike, so test points next to training points aren't really new. How you split the data should match the prediction task you care about, such as new sites within the same region or a different region.
+
+This lab works through both choices with a virtual species, so you can see how much the answers move.
+
+## Key concepts
+
+### The confusion matrix
+
+To compare a probability $\hat p$ with a 0/1 observation, first pick a **threshold** $t$ and predict "presence" wherever $\hat p > t$. Each test site then falls into one of four cells. Here they are laid out the way caret (R) and `sdm.confusion_summary()` (Python) print them, with predictions in rows. Wikipedia uses the transpose.
+
+|  | Observed absence (0) | Observed presence (1) |
+|---|---|---|
+| **Predicted absence (0)** | true negative (TN) | false negative (FN), an *omission* error |
+| **Predicted presence (1)** | false positive (FP), a *commission* error | true positive (TP) |
+
+With $n = TP + FP + FN + TN$ sites, the **prevalence** in the test data is $(TP + FN)/n$.
+
+### Threshold-dependent metrics
+
+Almost every single-number summary of a confusion matrix is one of the following, and most have several names (Liu et al. 2011, Table 2):
+
+| Metric | Also called | Formula | Question it answers |
+|---|---|---|---|
+| Accuracy | overall accuracy, correct classification rate | $\dfrac{TP + TN}{n}$ | What fraction of sites did we classify correctly? |
+| No information rate | | $\max(\text{prev},\ 1 - \text{prev})$ | What accuracy would "always guess the more common class" get? |
+| Sensitivity | recall, true positive rate | $\dfrac{TP}{TP + FN}$ | Of the occupied sites, what fraction did we predict as presences? |
+| Specificity | true negative rate | $\dfrac{TN}{TN + FP}$ | Of the unoccupied sites, what fraction did we predict as absences? |
+| Positive predictive value | precision | $\dfrac{TP}{TP + FP}$ | Of the sites we called presences, what fraction really are? |
+| Negative predictive value | | $\dfrac{TN}{TN + FN}$ | Of the sites we called absences, what fraction really are? |
+| True skill statistic (TSS) | Youden's J, Peirce skill score | $\text{Sens} + \text{Spec} - 1$ | 0 = no better than random, 1 = perfect |
+| Cohen's kappa | Heidke skill score | $\dfrac{\text{Acc} - p_e}{1 - p_e}$ | How much better than chance agreement is our accuracy? |
+
+Here $p_e = \big[(TP+FP)(TP+FN) + (TN+FN)(TN+FP)\big]/n^2$ is the accuracy you'd expect by chance, given how many presences you predicted and how many there were.
+
+**Prevalence matters.** These metrics respond differently to how common the species is:
+
+* **Accuracy** can look excellent for a rare species just by predicting "absent" everywhere. With 5% prevalence, that useless model is 95% accurate. That's why caret reports the no information rate beside it.
+* **Sensitivity and specificity** are each computed within one class (presences only or absences only), so they don't depend directly on the mix of presences and absences in the test data. **PPV and NPV** mix the two classes, so they do.
+* **Kappa** depends on prevalence even when sensitivity and specificity are held fixed. Allouche et al. (2006) showed that the relationship is unimodal and proposed **TSS**, which is built only from sensitivity and specificity, as an alternative that keeps kappa's advantages without that dependence. Santika (2011) uses simulated species to explore how prevalence affects a range of metrics.
+
+::: {.concept}
+**No metric is "the" accuracy.** Each one weighs omission and commission errors differently. For binary predictions, Liu et al. (2011) suggest reporting both sensitivity/specificity and PPV/NPV, plus overall measures like kappa or TSS. Whatever you report, give a confidence interval: with a few hundred test sites, a metric's sampling error is often larger than the difference between two models.
+:::
+
+### Choosing a threshold
+
+Every metric above changes as the threshold $t$ moves. Lower $t$ and you predict more presences: sensitivity rises and specificity falls. Common rules, all of which you'll try in the lab:
+
+* **0.5.** Halfway between 0 and 1, but arbitrary. For a rare species, few sites may get $\hat p > 0.5$.
+* **Minimum training presence.** The lowest fitted value at any training presence, so every training presence is predicted correctly. One odd presence can drag it very low.
+* **10th percentile training presence.** Allows 10% of training presences to be missed, which makes it less sensitive to outliers.
+* **Prevalence-based.** A value tied to the training prevalence (the lab uses the proportion of 0s in the training data).
+* **Sensitivity = specificity**, or **maximum sensitivity + specificity** (that is, maximum TSS). The second is pROC's default "best" point.
+
+Choose the threshold using the *training* data (or a separate validation set). If you pick it to look good on the test data, the test score is no longer an honest estimate.
+
+### ROC curves and AUC
+
+A **receiver operating characteristic (ROC) curve** removes the threshold choice by drawing every threshold at once. It plots sensitivity against the false positive rate (1 − specificity). pROC draws specificity on the x-axis running from 1 down to 0, which gives the same curve. The diagonal is a model that ranks sites at random. A perfect model hugs the top-left corner.
+
+The **area under the curve (AUC)** has a useful interpretation: it is the probability that a randomly chosen presence site gets a higher prediction than a randomly chosen absence site (ties count ½):
+
+$$
+\text{AUC} = \frac{1}{n_1 n_0} \sum_{i \in \text{presences}} \ \sum_{j \in \text{absences}}
+\Big[\mathbf{1}(\hat p_i > \hat p_j) + \tfrac12\, \mathbf{1}(\hat p_i = \hat p_j)\Big].
+$$
+
+So AUC = 0.5 means random ranking and AUC = 1 means every presence outranks every absence. Because AUC depends only on the *order* of the predictions, it says nothing about whether the probabilities themselves are right. You could square every prediction and AUC wouldn't change. The lab's confidence intervals use DeLong's method (pROC's default, also in `sdm.auc_ci()`).
+
+**Critiques.** Lobo et al. (2008) argue that AUC is often misleading for distribution models, for five reasons:
+
+1. it ignores the predicted probability values and the goodness-of-fit of the model;
+2. it summarizes performance over regions of ROC space where one would rarely operate;
+3. it weights omission and commission errors equally;
+4. it gives no information about where in space the errors are; and
+5. most importantly, the total extent of the study area strongly affects how many absences are easy to predict, and therefore the AUC.
+
+One response is the **partial AUC**: the area under only part of the curve, such as specificity between 0.3 and 0.7 in the lab. Liu et al. (2011) consider partial AUC worth recommending, but the range is a subjective choice, which makes values hard to compare across studies. By default, pROC reports the raw partial area, whose maximum is the width of the range (0.4 here), not 1.
+
+### Precision–recall curves and many easy negatives
+
+A **precision–recall (PR) curve** plots precision (PPV) against recall (sensitivity) across thresholds. It shares one axis with the ROC curve (recall = sensitivity = true positive rate). The other axis differs in its denominator:
+
+$$
+\text{false positive rate} = \frac{FP}{FP + TN} = \frac{FP}{\text{all absences}}, \qquad
+\text{precision} = \frac{TP}{TP + FP} = \frac{TP}{\text{all predicted presences}}.
+$$
+
+Now think about Lobo et al.'s fifth point. Suppose the study extent is far larger than the species' range, so there are many absences the model easily predicts near zero. Which of these two denominators grows when you add them, and which doesn't? In Exercise 2 you'll add 1,000 such "easy negatives" and compare the curves before and after. (Davis & Goadrich 2006 work out the formal relationship between ROC and PR curves.)
+
+### Cross-validation strategies
+
+A metric is only as honest as the test data behind it. The lab compares several ways to get test data:
+
+| Strategy | Fit on | Score on | What it tells you |
+|---|---|---|---|
+| **Resubstitution** | all data | the same data | Goodness of fit. Optimistic about prediction, especially for flexible models. |
+| **Random split** | a random half | the other half | Prediction to new sites *like* the training sites. Optimistic when nearby sites are dependent. |
+| **Spatial split** (east/west, checkerboard) | one region | another region | Transfer to new places. May force the model to extrapolate to new environments. |
+| **k-fold** | all but one fold, *k* times | each fold in turn | Every point is tested once. Folds can be random, stratified by prevalence, or spatial blocks. |
+
+```{mermaid}
+%%| fig-width: 7
+flowchart LR
+  A["All data"] --> B["Split into k folds"]
+  B --> C["For each fold:<br/>fit on the other k − 1,<br/>predict the held-out fold"]
+  C --> D["Pool all held-out<br/>predictions → one AUC"]
+  C --> E["Score each fold →<br/>mean ± sd of k AUCs"]
+```
+
+**Why structure matters.** Roberts et al. (2017) show that ecological data almost always have dependence structure: in space, time, groups (such as individuals or sites), or phylogeny. When training and test points are close in that structure, they aren't independent, and random cross-validation underestimates prediction error. Worse, a model can use predictors that happen to track the structure, such as a climate variable that varies smoothly in space, to fit patterns that aren't causal. Their recommendation is **block cross-validation**, which holds out whole blocks (regions, years, groups) at a time, "wherever dependence structures exist in a dataset."
+
+Blocking has a cost too. If blocks follow environmental gradients, a held-out block may contain conditions the model never saw in training, so the error estimate mixes in *extrapolation*. Roberts et al.'s simulations suggest that spatial blocks should be clearly larger than the range of autocorrelation in the model residuals, but no larger than needed. The best split depends on how the model will be used: to fill in gaps within the study region, or to predict to new regions or a new climate.
+
+::: {.concept}
+**Match the test to the use.** If the map will be used to predict at new sites scattered among the surveyed ones, a random split may be fine. If it will be used to predict to a new region or a future climate, hold out data that are *different* in the same way: a block, a region, or a time period. The blockCV package (Valavi et al. 2019) builds spatial and environmental blocks for k-fold CV in R. The Python lab builds simple grid blocks with scikit-learn's `GroupKFold`.
+:::
+
+## What you'll do
+
+1. Simulate presence/absence for the Lab 1 virtual species at 500 random sites, and split them into training and test halves.
+2. Fit a logistic regression that uses one wrong variable, and threshold its predictions at 0.5. Compute the confusion matrix, kappa, sensitivity, specificity, and TSS.
+3. Compute several alternative thresholds from the training data. **Exercise 1:** rerun the metrics at one of them.
+4. Draw ROC and precision–recall curves, and compute AUC with a confidence interval and a partial AUC. **Exercise 2:** add 1,000 easy absences and compare the curves.
+5. Evaluate a misspecified model by resubstitution, a random split, an east/west split, and a checkerboard split. **Question 1:** explain the differences.
+6. Run stratified 5-fold cross-validation, pooling predictions and averaging fold AUCs. **Exercise 3:** try other numbers of folds.
+7. *Bonus:* spatial block folds with blockCV (R), or grid blocks with `GroupKFold` (Python).
+
+## Get the starter code
+
+Both versions do the same analysis step by step. Pick the language you're learning (or try both!). New to the course? Start with [Get set up](../setup.qmd).
+
+::: {.starter-code}
+::: {.track}
+#### R
+
+[Read the R lab](../r/lab02-evaluation.qmd){.btn .btn-primary}
+[R starter kit (.zip)](../downloads/fw532-R-labs.zip){.btn .btn-outline-primary}
+
+In the kit, open `fw532.Rproj`, then `r/lab02-evaluation.qmd`. Uses **terra**, **caret**, **pROC**, **PRROC**, **sf**, and **blockCV**.
+:::
+
+::: {.track .python}
+#### Python
+
+[Read the Python lab](../python/lab02-evaluation.qmd){.btn .btn-primary}
+[Open in Colab](https://colab.research.google.com/github/Hutchinson-Lab/fw532/blob/main/python/lab02-evaluation.ipynb){.btn .btn-outline-primary}
+[Python starter kit (.zip)](../downloads/fw532-python-labs.zip){.btn .btn-outline-primary}
+
+Open `python/lab02-evaluation.ipynb`. Uses **numpy**, **pandas**, **matplotlib**, **statsmodels**, **scipy**, and **scikit-learn**.
+:::
+:::
+
+## Turn in
+
+Post to the Canvas discussion for this lab by the due date on Canvas. Include brief descriptions of your exploration of the exercises. If applicable, also include:
+
+* key take-aways you'd want to remember for a future SDM project, and
+* remaining questions or confusions you'd like to learn more about.
+
+## Readings & resources
+
+* Liu, C., White, M., & Newell, G. (2011). Measuring and comparing the accuracy of species distribution models with presence–absence data. *Ecography*, 34(2), 232–243. <https://doi.org/10.1111/j.1600-0587.2010.06354.x>
+* Roberts, D. R., Bahn, V., Ciuti, S., et al. (2017). Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure. *Ecography*, 40(8), 913–929. <https://doi.org/10.1111/ecog.02881>
+* Allouche, O., Tsoar, A., & Kadmon, R. (2006). Assessing the accuracy of species distribution models: Prevalence, kappa and the true skill statistic (TSS). *Journal of Applied Ecology*, 43(6), 1223–1232. <https://doi.org/10.1111/j.1365-2664.2006.01214.x>
+* Lobo, J. M., Jiménez-Valverde, A., & Real, R. (2008). AUC: A misleading measure of the performance of predictive distribution models. *Global Ecology and Biogeography*, 17(2), 145–151. <https://doi.org/10.1111/j.1466-8238.2007.00358.x>
+* Santika, T. (2011). Assessing the effect of prevalence on the predictive performance of species distribution models using simulated data. *Global Ecology and Biogeography*, 20(1), 181–192. <https://doi.org/10.1111/j.1466-8238.2010.00581.x>
+* Bahn, V., & McGill, B. J. (2013). Testing the predictive performance of distribution models. *Oikos*, 122(3), 321–331. <https://doi.org/10.1111/j.1600-0706.2012.00299.x>
+* Hijmans, R. J. (2012). Cross-validation of species distribution models: Removing spatial sorting bias and calibration with a null model. *Ecology*, 93(3), 679–688. <https://doi.org/10.1890/11-0826.1>
+* Valavi, R., Elith, J., Lahoz-Monfort, J. J., & Guillera-Arroita, G. (2019). blockCV: An R package for generating spatially or environmentally separated folds for k-fold cross-validation of species distribution models. *Methods in Ecology and Evolution*, 10(2), 225–232. <https://doi.org/10.1111/2041-210X.13107>
+* Peterson, A. T., Papeş, M., & Soberón, J. (2008). Rethinking receiver operating characteristic analysis applications in ecological niche modeling. *Ecological Modelling*, 213, 63–72. <https://doi.org/10.1016/j.ecolmodel.2007.11.008>
+* Davis, J., & Goadrich, M. (2006). The relationship between precision-recall and ROC curves. *Proceedings of the 23rd International Conference on Machine Learning (ICML '06)*, 233–240.
+* Fielding, A. H., & Bell, J. F. (1997). A review of methods for the assessment of prediction errors in conservation presence/absence models. *Environmental Conservation*, 24(1), 38–49.
+* Wikipedia: [Evaluation of binary classifiers](https://en.wikipedia.org/wiki/Evaluation_of_binary_classifiers) · [Cohen's kappa](https://en.wikipedia.org/wiki/Cohen%27s_kappa) · [Mutual information](https://en.wikipedia.org/wiki/Mutual_information) · [ROC curves](https://en.wikipedia.org/wiki/Receiver_operating_characteristic)

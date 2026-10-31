@@ -1,0 +1,123 @@
+---
+title: "Lab 1: Simulation & Types of Data"
+subtitle: "Build a virtual species, then see whether a model can find it again"
+description: "Simulate presence/absence data for a virtual species from real climate layers, fit logistic regressions, and compare what they learn to the truth."
+image: images/lab01.png
+order: 1
+---
+
+::: {.lab-meta}
+[Week 1]{} [Reading: Guillera-Arroita et al. (2015)]{} [Methods: simulation, logistic regression]{} [R · Python]{}
+:::
+
+## Why this lab?
+
+A species distribution model (SDM) links records of where a species was (or wasn't) found to the environmental conditions at those places. With real data, we never get to see the "right answer". We don't know which variables truly matter, how they combine, or what the real map of occurrence looks like. That makes it hard to tell whether a modeling choice helped or hurt.
+
+**Simulation solves this.** If we invent a species ourselves, a *virtual species* whose probability of occurrence is a formula we chose, then we know the truth and can check any method against it. Did the model pick the right variables? Did it recover the coefficients? Does its map look like the true map? We'll use virtual species like this throughout the course to probe every method we meet, from logistic regression to random forests, boosted trees, and Maxent.
+
+This first lab builds the simulator you'll reuse all term, and gets you comfortable working with raster (gridded map) data.
+
+## Key concepts
+
+### The data-generating process
+
+Every simulated dataset in this course follows the same recipe. Real environmental layers go in, and presence/absence records come out:
+
+```{mermaid}
+%%| fig-width: 7
+flowchart LR
+  A["Environmental<br/>rasters x"] --> B["Linear predictor<br/>η = β₀ + β₁x₁ + …"]
+  B --> C["Logistic link<br/>ψ = 1 / (1 + e<sup>−η</sup>)"]
+  C --> D["Probability of<br/>occurrence ψ"]
+  D --> E["Coin flip<br/>y ~ Bernoulli(ψ)"]
+  E --> F["Presence/absence<br/>records"]
+  F -. "fit a model,<br/>compare to truth" .-> B
+```
+
+In symbols, for a location $s$ with environmental values $x_1(s), \dots, x_p(s)$:
+
+$$
+\psi(s) = \text{logistic}\big(\beta_0 + \beta_1 x_1(s) + \dots + \beta_p x_p(s)\big),
+\qquad y(s) \sim \text{Bernoulli}\big(\psi(s)\big).
+$$
+
+The randomness in the last step matters. Even a perfect model can't predict every record, because occurrence itself is a chance outcome. A site with $\psi = 0.9$ is usually occupied but not always.
+
+::: {.concept}
+**Truth vs. data vs. model.** Keep three things separate: the *true* surface $\psi(s)$ (which you'd never see in the real world), the *data* $y$ (noisy draws at a sample of sites), and the *model's* estimate $\hat\psi(s)$. A good model gets $\hat\psi$ close to $\psi$, not merely close to the particular $y$ values it was trained on.
+:::
+
+### Types of species data
+
+What you can learn depends on what kind of records you have. Guillera-Arroita et al. (2015) argue that many SDM problems come from mismatches between the data, the model, and the question being asked.
+
+| Data type | What is recorded | What it can tell you |
+|---|---|---|
+| **Presence–absence** | Whether the species was detected at each surveyed site | Probability of occurrence, *if* detection is near-perfect |
+| **Detection/non-detection with repeat visits** | Detections over several visits to each site | Occurrence corrected for imperfect detection (occupancy models) |
+| **Presence-only** (with background points) | Places the species was recorded, e.g. museum or citizen-science records | *Relative* suitability. Prevalence and absolute probability need extra assumptions |
+| **Counts / abundance** | Number of individuals | Expected abundance, which is richer than occurrence |
+
+In this lab we simulate presence–absence data with perfect detection, the simplest case. In the exercise you're encouraged to try another type, such as counts. Later labs simulate presence-only data for Maxent.
+
+### What can go wrong when fitting
+
+Even with the right *kind* of model (here, logistic regression), estimates can drift from the truth:
+
+* **Omitted variables.** Leave out a variable that matters and the model compensates with whatever is correlated with it.
+* **Extra or correlated variables.** Many climate variables are strongly correlated with each other. A model with the "wrong" variable can still predict well, while its coefficients mislead you about *why*.
+* **Small or biased samples.** Fewer points mean noisier estimates. Points that aren't sampled at random (e.g., near roads) can bias them.
+
+You'll see all three when you compare models 1–4 in the lab, both through their coefficients and through their predicted maps.
+
+### Reproducible randomness
+
+Simulations use random numbers, so we fix a *seed* to make results repeatable. Reusing the *same* seed for two different random steps is a subtle trap: it replays the same random numbers, which can create correlations that aren't supposed to be there. The lab shows a concrete example.
+
+## What you'll do
+
+1. Load 20 environmental layers (WorldClim climate + elevation) for North America.
+2. Sample 1,000 random locations and check how correlated the variables are.
+3. Define a virtual species from three variables and draw presence/absence at each location.
+4. Fit logistic regressions with the right variables, a missing variable, and an extra variable.
+5. Compare coefficients and predicted maps against the truth.
+6. **Exercise:** design your own virtual species.
+
+## Get the starter code
+
+Both versions do the same analysis step by step. Pick the language you're learning (or try both!). New to the course? Start with [Get set up](../setup.qmd).
+
+::: {.starter-code}
+::: {.track}
+#### R
+
+[Read the R lab](../r/lab01-simulation.qmd){.btn .btn-primary}
+[R starter kit (.zip)](../downloads/fw532-R-labs.zip){.btn .btn-outline-primary}
+
+In the kit, open `fw532.Rproj`, then `r/lab01-simulation.qmd`. Uses **terra**, **ggplot2**, and **ggcorrplot**.
+:::
+
+::: {.track .python}
+#### Python
+
+[Read the Python lab](../python/lab01-simulation.qmd){.btn .btn-primary}
+[Open in Colab](https://colab.research.google.com/github/Hutchinson-Lab/fw532/blob/main/python/lab01-simulation.ipynb){.btn .btn-outline-primary}
+[Python starter kit (.zip)](../downloads/fw532-python-labs.zip){.btn .btn-outline-primary}
+
+Open `python/lab01-simulation.ipynb`. Uses **numpy**, **pandas**, **matplotlib**, and **statsmodels**.
+:::
+:::
+
+## Turn in
+
+Post to the Canvas discussion for this lab by the due date on Canvas. Include a brief description of your simulated species (what aspects of the process you explored), plots, and any comments. If applicable, also include:
+
+* key take-aways you'd want to remember for a future SDM project, and
+* remaining questions or confusions you'd like to learn more about.
+
+## Readings & resources
+
+* Guillera-Arroita, G., Lahoz-Monfort, J. J., Elith, J., et al. (2015). Is my species distribution model fit for purpose? Matching data and models to applications. *Global Ecology and Biogeography*, 24(3), 276–292. <https://doi.org/10.1111/geb.12268>
+* Elith, J., & Leathwick, J. R. (2009). Species distribution models: Ecological explanation and prediction across space and time. *Annual Review of Ecology, Evolution, and Systematics*, 40, 677–697. <https://doi.org/10.1146/annurev.ecolsys.110308.120159>
+* WorldClim bioclimatic variables: <https://www.worldclim.org/data/bioclim.html>

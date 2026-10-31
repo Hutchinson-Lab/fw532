@@ -1,0 +1,126 @@
+---
+title: "Demo: Sampling from a Point Process"
+subtitle: "FW 532 · R version"
+---
+
+# Can we sample from an IPP in R to understand it better?
+
+First, let's get the spatstat library and go back to our simulation of abundance data, to produce an intensity raster.
+
+```{r}
+#| message: false
+library(terra)      # rasters (gridded maps)
+library(spatstat)   # point patterns and point processes
+library(here)       # file paths relative to the project folder
+
+envStack <- rast(here("data", "envStack.tif"))
+```
+
+```{r}
+# scale variables
+envStack <- scale(envStack)
+
+intercept <- 2
+beta1 <- 0.5
+beta2 <- -0.5
+beta3 <- 0.25
+beta4 <- -0.05
+beta5 <- -0.2
+lambdaRaster <- exp(intercept +
+                      beta1 * scale(envStack$Mean.Diurnal.Range) +
+                      beta2 * scale(envStack$Isothermality) +
+                      beta3 * scale(envStack$Mean.Temperature.of.Wettest.Quarter) +
+                      beta4 * scale(envStack$Mean.Diurnal.Range)^2 + # quadratic term
+                      beta5 * scale(envStack$Isothermality) * scale(envStack$Mean.Temperature.of.Wettest.Quarter)) # interaction term
+names(lambdaRaster) <- "lambda"
+
+plot(lambdaRaster)
+```
+
+```{r}
+#| fig-height: 6
+nPoints <- 1000
+set.seed(1234) # any number will work as input here; using the same one will give the same results
+simPts <- spatSample(envStack, size = nPoints, method = "random",
+                     na.rm = TRUE, xy = TRUE) # could change this from random to a procedure reflecting sampling bias
+
+# get the mean abundances that correspond to the points we selected:
+lambdas <- extract(lambdaRaster, simPts[, c("x", "y")], ID = FALSE)$lambda
+
+# sample from these means (with a *different* seed; see Lab 1):
+set.seed(5678)
+abund <- rpois(n = nPoints, lambda = lambdas) # sampling from a Poisson instead of binomial now
+# put response and variables together in a data.frame:
+abundDF <- cbind(abund, simPts)
+
+# plot the three relevant climate variables and the mean abundance raster
+plot(c(envStack$Mean.Diurnal.Range,
+       envStack$Isothermality,
+       envStack$Mean.Temperature.of.Wettest.Quarter,
+       lambdaRaster),
+     main = c("Mean.Diurnal.Range", "Isothermality",
+              "Mean.Temperature.of.Wettest.Quarter", "Mean Abundance"))
+```
+
+Here λ is the mean count at a *site* (a cell). A point process uses the same kind of surface as an *intensity*: the expected number of points per unit area. Under an inhomogeneous Poisson process (IPP), the number of points that land in a cell is Poisson with mean λ × (cell area), so the counts above are what an IPP would give if we measured area in "cells".
+
+`rpoispp()` wants a spatstat pixel image (an `im`), so we convert our raster. We give `im()` the real longitude and latitude of the pixel centres, so that areas are in square degrees. Mind the row order: terra stores rows from north to south (row 1 is the top of the map), while spatstat wants row 1 of the matrix to be the *southernmost* row (y increasing), so we flip the matrix.
+
+```{r}
+lambdaMat <- as.matrix(lambdaRaster, wide = TRUE)   # row 1 = northernmost row
+lambdaImg <- im(lambdaMat[nrow(lambdaMat):1, ],      # flip: row 1 = southernmost row
+                xcol = xFromCol(lambdaRaster, 1:ncol(lambdaRaster)),         # longitudes, west to east
+                yrow = rev(yFromRow(lambdaRaster, 1:nrow(lambdaRaster))))    # latitudes, south to north
+lambdaImg
+```
+
+The number of points an IPP generates is Poisson distributed with mean equal to the integral of the intensity over the whole region, $\Lambda = \int_D \lambda(s)\,ds$. For a raster, the integral is a sum over cells: $\Lambda = \sum_{\text{cells}} \lambda_{\text{cell}} \times (\text{cell area})$. Our cells are 1/6 × 1/6 degree, so each has an area of 1/36 ≈ 0.028 square degrees.
+
+```{r}
+cellArea <- prod(res(lambdaRaster))                     # square degrees per cell
+sumLambda <- global(lambdaRaster, "sum", na.rm = TRUE)[1, 1]
+c(sumOfLambda = sumLambda, cellArea = cellArea, expectedCount = sumLambda * cellArea)
+integral(lambdaImg)   # spatstat computes the same integral
+```
+
+So an IPP with this intensity would produce about `r format(round(integral(lambdaImg)), big.mark = ",")` points: enough to crowd the map. In the next chunk we divide the intensity by `scaleFactor` to get a sparser pattern.
+
+You can run this chunk repeatedly to see samples from the IPP (there is no seed, so each run gives a new sample):
+
+```{r}
+#| fig-height: 5.5
+scaleFactor <- 25   # Experimenting with scaling. Without dividing, the map is crowded with points.
+IPPsamp <- rpoispp(lambdaImg / scaleFactor) # sample from the IPP
+plot(lambdaImg / scaleFactor, col = terrain.colors(12, rev = TRUE),
+     main = paste("IPP sample with", npoints(IPPsamp), "points")) # plot the (scaled) lambda as a base
+points(IPPsamp, col = "red", pch = 20, cex = 0.5) # add the sampled points on top in red
+```
+
+I believe we read that the number of points that are generated is Poisson distributed with mean equal to the integral of the intensity process over the entire domain. Here that integral is `r round(integral(lambdaImg / scaleFactor))`: the sum of the scaled λ values times the cell area. If you sample a few times, you might believe that the numbers are coming from Pois(`r round(integral(lambdaImg / scaleFactor))`). Let's check with ten draws:
+
+```{r}
+expectedCount <- integral(lambdaImg / scaleFactor)
+draws <- rpoispp(lambdaImg / scaleFactor, nsim = 10)
+counts <- unname(sapply(draws, npoints))
+counts
+c(expected = expectedCount, meanOfDraws = mean(counts),
+  sdOfDraws = sd(counts), poissonSD = sqrt(expectedCount))
+```
+
+This is why the scaling matters too: dividing λ by `scaleFactor` divides the expected count by the same amount.
+
+::: {.callout-note title="The units of area matter"}
+λ is a rate *per unit area*, so its values only mean something once the units of area are fixed. If you build the image with `as.im(as.matrix(lambdaRaster))` and no coordinates, spatstat uses pixel units: each pixel is 1 × 1, so the expected count is simply the *sum* of the pixel values (`r format(round(sumLambda), big.mark = ",")` here, before scaling). With real coordinates each pixel is 1/36 of a square degree, so the same values give 36 times fewer points. A square degree isn't a fixed area on the ground, either: it shrinks toward the poles. (`terra::cellSize()` gives cell areas in km² if you want ground units.)
+:::
+
+We might think of a background sample as coming from a homogeneous Poisson process instead. Sampling the entire geographic area regardless of the species intensity.
+
+```{r}
+#| fig-height: 5.5
+bkgdImg <- lambdaImg * 0 + 0.3 # You can play with the constant here to see how it changes the number of points
+bkgdSamp <- rpoispp(bkgdImg)
+plot(bkgdImg, col = "grey85", main = paste("Background sample with", npoints(bkgdSamp), "points"))
+points(bkgdSamp, col = "blue", pch = 20, cex = 0.5)
+```
+
+For a constant intensity, the integral is just the constant times the area of the region: 0.3 × `r round(area(as.owin(bkgdImg)))` square degrees of land ≈ `r round(integral(bkgdImg))` points expected. In Maxent (Lab 6), background points play this role: a sample of the available environments that is used to approximate the integral of λ over the region (Renner et al. 2015).

@@ -1,0 +1,20 @@
+# FW 532 Python labs -- conda / mamba alternative to requirements.txt:
+#   conda env create -f environment.yml
+#   conda activate fw532
+name: fw532
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - pandas
+  - matplotlib
+  - scipy
+  - scikit-learn
+  - statsmodels
+  - rasterio
+  - jupyterlab
+  - ipykernel
+  - pip
+  - pip:
+      - elapid

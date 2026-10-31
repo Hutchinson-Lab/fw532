@@ -1,0 +1,338 @@
+---
+title: "Demo: Marginal vs. Partial Effects"
+subtitle: "FW 532 · Python version"
+---
+
+**Goals:**
+
+* To see the difference between *marginal* and *partial* effect plots, and compare both to the true
+  effect of a variable in a simulated species.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* Python packages: numpy, pandas, matplotlib, statsmodels, scikit-learn, rasterio (see
+  `requirements.txt`)
+* The course helper module `sdmlab.py` (in the same folder as this notebook)
+
+Run the cells in order from top to bottom.
+
+```{python}
+# Running on Google Colab? This cell downloads the course files. (Anywhere else it does nothing.)
+import os, sys
+if "google.colab" in sys.modules:
+    if not os.path.exists("/content/fw532"):
+        !git clone -q --depth 1 https://github.com/Hutchinson-Lab/fw532.git /content/fw532
+        %pip install -q rasterio
+    os.chdir("/content/fw532/python")
+```
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+
+import sdmlab as sdm   # course helpers for rasters
+
+env_stack = sdm.load_env()
+
+# scale variables
+env_stack = env_stack.scale()
+pred_vars = env_stack.names
+```
+
+# Two ways to show the effect of one variable
+
+Most of our models have many predictors, but we usually want to look at the effect of one (or two)
+at a time. There are two common ways to collapse a model down to one variable, $x_j$. Write
+$\hat f(x_j, \mathbf{x}_{-j})$ for the model's prediction, where $\mathbf{x}_{-j}$ are all of the
+*other* variables.
+
+* A **marginal effect** sets all of the other variables to their means and varies only $x_j$:
+  $\hat f\big(x_j = v,\ \mathbf{x}_{-j} = \bar{\mathbf{x}}_{-j}\big)$.
+  It is one slice through the model, at an "average" site.
+* A **partial effect** (the curve in a *partial dependence plot*, PDP) sets $x_j = v$ for *every*
+  data point, leaves the other variables at their observed values, and averages the predictions:
+  $\frac{1}{n}\sum_{i=1}^{n} \hat f\big(x_j = v,\ \mathbf{x}_{-j} = \mathbf{x}_{i,-j}\big)$.
+
+For a model that is linear on the scale of its predictions, these are the same. They differ when
+the model is nonlinear (including the logistic link that turns a linear predictor into a
+probability) and when $x_j$ interacts with other variables. Correlated predictors make the choice
+matter more: a partial effect averages over combinations of values that may never occur together
+in the real world, and a marginal effect describes a single "average" site that may not exist.
+
+In a simulation we also know the **true** effect, because we wrote down the probability of
+occurrence ourselves. So we can compute the true marginal and partial effects and check which
+features of each model's curves are real.
+
+# Simulate data
+
+```{python}
+# define logistic function
+def logistic(x):
+    return np.exp(x) / (1 + np.exp(x))
+
+# get points: cells with data for all 20 variables (basically North America, not oceans)
+n_points = 1000
+sim_pts = env_stack.sample_random(n_points, seed=1234)
+```
+
+This time the species responds to three variables, with a quadratic term and an interaction.
+`p_occ_fn()` gives the true probability of occurrence for (scaled) values of Mean.Diurnal.Range
+(`x1`), Isothermality (`x2`), and Mean.Temperature.of.Wettest.Quarter (`x3`). It works on single
+numbers, on columns of a DataFrame, and on whole maps alike.
+
+```{python}
+# set parameters
+intercept = -0.25
+beta1 = -1
+beta2 = 1
+beta3 = 1.5
+beta4 = 1
+beta5 = -1
+
+def p_occ_fn(x1, x2, x3):
+    return logistic(intercept
+                    + beta1 * x1
+                    + beta2 * x2
+                    + beta3 * x3
+                    + beta4 * x1 ** 2      # quadratic term
+                    + beta5 * x2 * x3)     # interaction term
+
+p_occ = p_occ_fn(env_stack["Mean.Diurnal.Range"],
+                 env_stack["Isothermality"],
+                 env_stack["Mean.Temperature.of.Wettest.Quarter"])
+
+# get the values that correspond to the points we selected:
+p_occs = sdm.extract(p_occ, env_stack, sim_pts["x"], sim_pts["y"])
+
+# sample from these probabilities (a new seed for a new random step; see Lab 1):
+rng = np.random.default_rng(5678)
+pres_abs = rng.binomial(n=1, p=p_occs)
+
+modeling_df = sim_pts.copy()
+modeling_df.insert(0, "presAbs", pres_abs)
+
+# plot the result
+ax = sdm.plot_map(p_occ, env_stack)
+absent = modeling_df["presAbs"] == 0
+ax.scatter(modeling_df.loc[absent, "x"], modeling_df.loc[absent, "y"], s=4, color="blue", label="non-detection")
+ax.scatter(modeling_df.loc[~absent, "x"], modeling_df.loc[~absent, "y"], s=4, color="red", label="detection")
+ax.legend(loc="center left")
+
+# split into training and test
+train_data = modeling_df.iloc[:n_points // 2]
+test_data = modeling_df.iloc[n_points // 2:]
+```
+
+(We applied `p_occ_fn()` directly to the layers of `env_stack`, which are already scaled, so the
+values in `train_data` are on the same scale that `p_occ_fn()` expects.)
+
+# The true effect of Mean.Diurnal.Range
+
+Let's start with the truth. The R version of this demo evaluates the effects at every value of
+Mean.Diurnal.Range observed in the training data (about 500 values). Here we use 100 evenly spaced
+values over the same range, which gives the same picture with less computing.
+
+```{python}
+var = "Mean.Diurnal.Range"
+mdr_grid = np.linspace(train_data[var].min(), train_data[var].max(), 100)
+
+# true MARGINAL effect: the other two variables at their means
+marg_ests_true = p_occ_fn(mdr_grid,
+                          train_data["Isothermality"].mean(),
+                          train_data["Mean.Temperature.of.Wettest.Quarter"].mean())
+
+# true PARTIAL effect: for each value, average over the observed values of the other two
+partial_ests_true = np.zeros(len(mdr_grid))
+for i in range(len(mdr_grid)):
+    partial_ests_true[i] = np.mean(p_occ_fn(mdr_grid[i],
+                                            train_data["Isothermality"],
+                                            train_data["Mean.Temperature.of.Wettest.Quarter"]))
+
+fig, ax = plt.subplots(figsize=(7, 4.5))
+ax.plot(mdr_grid, marg_ests_true, color="tab:red", label="true marginal")
+ax.plot(mdr_grid, partial_ests_true, color="tab:cyan", label="true partial")
+ax.set_ylim(0, 1)
+ax.set_xlabel("Mean.Diurnal.Range (scaled)")
+ax.set_ylabel("p(spp)")
+ax.legend();
+```
+
+Even for the true model, the two curves differ: here the partial curve is a little lower, and its
+dip is wider. The truth has no interaction involving Mean.Diurnal.Range, but the logistic link is
+nonlinear, so averaging probabilities over many sites (partial) is not the same as computing the
+probability at one average site (marginal).
+
+# Fit three models
+
+A boosted regression tree with only the 3 relevant variables, a random forest with 7 variables (the
+3 relevant ones plus 4 others), and a misspecified GLM with the 3 relevant variables but no
+quadratic or interaction terms.
+
+The R version fits the BRT with `dismo::gbm.fixed()` (learning rate 0.001, tree complexity 2, 5000
+trees, bag fraction 0.5); we match those settings in scikit-learn (a tree complexity of 2 means 2
+splits, so 3 leaves). For the random forest, R's defaults are 500 trees and `mtry` = 2 (the square
+root of 7, rounded down) for classification.
+
+```{python}
+brt_vars = ["Isothermality", "Mean.Diurnal.Range", "Mean.Temperature.of.Wettest.Quarter"]  # only the 3 relevant
+model_brt = GradientBoostingClassifier(learning_rate=0.001, n_estimators=5000,
+                                       max_leaf_nodes=3, max_depth=None,
+                                       subsample=0.5, min_samples_leaf=10, random_state=2468)
+model_brt.fit(train_data[brt_vars], train_data["presAbs"])
+
+rf_vars = ["Annual.Mean.Temperature", "Mean.Diurnal.Range", "Mean.Temperature.of.Wettest.Quarter",
+           "Annual.Precipitation", "Precipitation.Seasonality", "elevation", "Isothermality"]
+model_rf = RandomForestClassifier(n_estimators=500, max_features=2, n_jobs=-1, random_state=1357)
+model_rf.fit(train_data[rf_vars], train_data["presAbs"])
+
+glm_vars = ["Mean.Diurnal.Range", "Isothermality", "Mean.Temperature.of.Wettest.Quarter"]
+model_glm_misspec = sm.GLM(train_data["presAbs"], sm.add_constant(train_data[glm_vars]),
+                           family=sm.families.Binomial()).fit()
+```
+
+Each model predicts in a slightly different way, so we write one small `predict` function per model.
+Each takes a DataFrame with (at least) the model's variables and returns the probability of presence.
+
+```{python}
+def predict_brt(df):
+    return model_brt.predict_proba(df[brt_vars])[:, 1]
+
+def predict_rf(df):
+    return model_rf.predict_proba(df[rf_vars])[:, 1]
+
+def predict_glm(df):
+    return model_glm_misspec.predict(sm.add_constant(df[glm_vars], has_constant="add"))
+```
+
+# Marginal vs. partial effects for each model
+
+Now the two recipes from the top of the page, as functions. Both take a model's `predict` function,
+the data, the variable, and the grid of values for that variable.
+
+```{python}
+def marginal_effect(predict, data, var, grid):
+    """Marginal effect: every other variable at its mean; only `var` changes."""
+    new_data = pd.DataFrame({col: np.repeat(data[col].mean(), len(grid)) for col in data.columns})
+    new_data[var] = grid
+    return np.asarray(predict(new_data))
+
+
+def partial_effect(predict, data, var, grid):
+    """Partial effect: for each value, set `var` to it for EVERY row of `data`, predict, and average."""
+    pd_values = np.zeros(len(grid))
+    for i, value in enumerate(grid):
+        new_data = data.copy()
+        new_data[var] = value
+        pd_values[i] = np.mean(predict(new_data))
+    return pd_values
+
+
+def plot_effects(grid, marginal, partial, title, data, var, truth=None):
+    """Model curves (solid), true curves (dashed), and a rug of the observed values."""
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    ax.plot(grid, marginal, color="tab:red", linewidth=2, label="marginal (fitted model)")
+    ax.plot(grid, partial, color="tab:cyan", linewidth=2, label="partial (fitted model)")
+    if truth is not None:
+        ax.plot(grid, truth[0], color="tab:red", linestyle="--", label="marginal (truth)")
+        ax.plot(grid, truth[1], color="tab:cyan", linestyle="--", label="partial (truth)")
+    # rug: a short tick at the bottom for each observed value
+    ax.plot(data[var], np.full(len(data), 0.01), "|", color="black", alpha=0.3, markersize=10)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel(var)
+    ax.set_ylabel("Predicted Response")
+    ax.set_title(title)
+    ax.legend(loc="upper center", fontsize=8, ncol=2)
+    plt.show()
+```
+
+`{col: ... for col in data.columns}` is a *dictionary comprehension*: it builds a dictionary with one
+entry per column, which `pd.DataFrame()` turns into a table.
+
+Each plot below shows both curves for one model (solid), the true curves from the simulation
+(dashed, same colors), and the observed values of the variable as a rug along the bottom. We average
+over the 500 training points, using all 20 predictor columns (each `predict` function picks out the
+variables its model needs).
+
+```{python}
+data = train_data[pred_vars]
+true_effects = (marg_ests_true, partial_ests_true)
+
+models = {"BRT (3 variables)": predict_brt,
+          "Random forest (7 variables)": predict_rf,
+          "Misspecified GLM (no quadratic or interaction terms)": predict_glm}
+
+for title, predict in models.items():
+    marg = marginal_effect(predict, data, var, mdr_grid)
+    part = partial_effect(predict, data, var, mdr_grid)
+    plot_effects(mdr_grid, marg, part, title, data, var, truth=true_effects)
+```
+
+> **Question:** For each model, which features of the marginal and partial curves match the truth,
+> and which don't? Which differences come from the model (e.g., the GLM can't represent a
+> quadratic), and which come from the difference between a marginal and a partial effect?
+
+> **Question:** Try `var = "Isothermality"`, which interacts with
+> Mean.Temperature.of.Wettest.Quarter in the true model. (You'll need to compute its true effects
+> the same way we did for Mean.Diurnal.Range.) How do the marginal and partial curves compare now?
+
+> **R vs. Python:** the models are fit with different software (scikit-learn instead of gbm and
+> randomForest) and different random numbers, so the curves won't match the R version exactly.
+
+# A two-variable partial effect
+
+With two variables we get a surface. Here is the partial effect of the two interacting variables,
+Isothermality and Mean.Temperature.of.Wettest.Quarter, from the BRT model, on an evenly spaced
+25 × 25 grid. The same recipe works: set *both* variables for every row, predict, and average.
+
+```{python}
+def partial_effect_2d(predict, data, var1, var2, grid1, grid2):
+    """pd_values[i, j] = average prediction with var1 = grid1[i] and var2 = grid2[j] for every row."""
+    pd_values = np.zeros((len(grid1), len(grid2)))
+    for i, v1 in enumerate(grid1):
+        for j, v2 in enumerate(grid2):
+            new_data = data.copy()
+            new_data[var1] = v1
+            new_data[var2] = v2
+            pd_values[i, j] = np.mean(predict(new_data))
+    return pd_values
+
+var1, var2 = "Isothermality", "Mean.Temperature.of.Wettest.Quarter"
+grid1 = np.linspace(train_data[var1].min(), train_data[var1].max(), 25)
+grid2 = np.linspace(train_data[var2].min(), train_data[var2].max(), 25)
+
+pd_brt_2d = partial_effect_2d(predict_brt, data, var1, var2, grid1, grid2)
+```
+
+For comparison, here is the true partial effect of the same two variables, computed from
+`p_occ_fn()` by averaging over the observed values of Mean.Diurnal.Range. The black points on the
+floor of each plot are the training data, so you can see where the surface is supported by data and
+where it is extrapolating.
+
+```{python}
+pd_true_2d = np.zeros((len(grid1), len(grid2)))
+for i, v1 in enumerate(grid1):
+    for j, v2 in enumerate(grid2):
+        pd_true_2d[i, j] = np.mean(p_occ_fn(train_data["Mean.Diurnal.Range"], v1, v2))
+
+X, Y = np.meshgrid(grid1, grid2, indexing="ij")   # X[i, j] = grid1[i], Y[i, j] = grid2[j]
+fig = plt.figure(figsize=(13, 5.5))
+for k, (surface, title) in enumerate([(pd_brt_2d, "BRT partial effect"),
+                                      (pd_true_2d, "True partial effect")]):
+    ax = fig.add_subplot(1, 2, k + 1, projection="3d")
+    ax.plot_surface(X, Y, surface, cmap="terrain", vmin=0, vmax=1, edgecolor="none", alpha=0.9)
+    ax.scatter(train_data[var1], train_data[var2], 0, color="black", s=2)   # training points on the floor
+    ax.set_zlim(0, 1)
+    ax.set_xlabel(var1, fontsize=8)
+    ax.set_ylabel(var2, fontsize=8)
+    ax.set_zlabel("Predicted Response", fontsize=8)
+    ax.set_title(title)
+    ax.view_init(elev=25, azim=-60)
+plt.show()
+```
+
+> **Question:** Where does the BRT surface match the true surface, and where doesn't it? Compare the
+> disagreements with where the training points are.

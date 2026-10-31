@@ -1,0 +1,180 @@
+---
+title: "Demo: Sampling from a Point Process"
+subtitle: "FW 532 · Python version"
+---
+
+You Will Need: numpy, matplotlib, rasterio, and the course helper module `sdmlab.py` (in the same
+folder as this notebook). Run the cells in order from top to bottom.
+
+```{python}
+# Running on Google Colab? This cell downloads the course files. (Anywhere else it does nothing.)
+import os, sys
+if "google.colab" in sys.modules:
+    if not os.path.exists("/content/fw532"):
+        !git clone -q --depth 1 https://github.com/Hutchinson-Lab/fw532.git /content/fw532
+        %pip install -q rasterio
+    os.chdir("/content/fw532/python")
+```
+
+# Can we sample from an IPP in Python to understand it better?
+
+First, let's go back to our simulation of abundance data, to produce an intensity raster. (The R
+version of this demo uses the spatstat package to sample point patterns. Python has no direct
+equivalent, so we write the sampler ourselves below; it takes only a few lines.)
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import sdmlab as sdm   # course helpers for rasters
+
+env_stack = sdm.load_env()
+```
+
+```{python}
+# scale variables
+env_stack = env_stack.scale()
+
+intercept = 2
+beta1 = 0.5
+beta2 = -0.5
+beta3 = 0.25
+beta4 = -0.05
+beta5 = -0.2
+mdr = sdm.scale(env_stack["Mean.Diurnal.Range"])
+iso = sdm.scale(env_stack["Isothermality"])
+mtwq = sdm.scale(env_stack["Mean.Temperature.of.Wettest.Quarter"])
+lambda_map = np.exp(intercept
+                    + beta1 * mdr
+                    + beta2 * iso
+                    + beta3 * mtwq
+                    + beta4 * mdr**2          # quadratic term
+                    + beta5 * iso * mtwq)     # interaction term
+
+sdm.plot_map(lambda_map, env_stack, title="lambda");
+```
+
+```{python}
+n_points = 1000
+# any number will work as the seed; using the same one will give the same results
+sim_pts = env_stack.sample_random(n_points, seed=1234)  # could change this from random to a procedure reflecting sampling bias
+
+# get the mean abundances that correspond to the points we selected:
+lambdas = sdm.extract(lambda_map, env_stack, sim_pts["x"], sim_pts["y"])
+
+# sample from these means (with a *different* seed; see Lab 1):
+rng = np.random.default_rng(5678)
+abund = rng.poisson(lam=lambdas)   # sampling from a Poisson instead of binomial now
+
+# put response and variables together in a DataFrame:
+abund_df = sim_pts.copy()
+abund_df.insert(0, "abund", abund)
+
+# plot the three relevant climate variables and the mean abundance raster
+fig, axes = plt.subplots(2, 2, figsize=(11, 6.5), constrained_layout=True)
+for ax, name in zip(axes.flat, ["Mean.Diurnal.Range", "Isothermality",
+                                "Mean.Temperature.of.Wettest.Quarter"]):
+    sdm.plot_map(env_stack[name], env_stack, ax=ax, title=name)
+sdm.plot_map(lambda_map, env_stack, ax=axes[1, 1], title="Mean Abundance");
+```
+
+Here λ is the mean count at a *site* (a cell). A point process uses the same kind of surface as an
+*intensity*: the expected number of points per unit area. Under an inhomogeneous Poisson process
+(IPP), the number of points that land in a cell is Poisson with mean λ × (cell area), so the counts
+above are what an IPP would give if we measured area in "cells".
+
+The number of points an IPP generates is Poisson distributed with mean equal to the integral of the
+intensity over the whole region, $\Lambda = \int_D \lambda(s)\,ds$. For a raster, the integral is a
+sum over cells: $\Lambda = \sum_{\text{cells}} \lambda_{\text{cell}} \times (\text{cell area})$. Our
+cells are 1/6 × 1/6 degree, so each has an area of 1/36 ≈ 0.028 square degrees. (`np.nansum()` adds
+up the values and skips the `nan` ocean cells.)
+
+```{python}
+cell_area = env_stack.res**2                 # square degrees per cell
+sum_lambda = np.nansum(lambda_map)
+print("sum of lambda   :", round(sum_lambda, 1))
+print("cell area       :", round(cell_area, 5), "square degrees")
+print("expected count  :", round(sum_lambda * cell_area, 1))
+```
+
+So an IPP with this intensity would produce about 22,600 points: enough to crowd the map. Below we
+divide the intensity by `scale_factor` to get a sparser pattern.
+
+**How to sample from an IPP on a raster.** Because λ is constant within each cell, an IPP breaks into
+independent pieces, one per cell: the number of points in a cell is Poisson with mean
+λ_cell × (cell area), and those points are spread uniformly at random within the cell. That's all the
+function below does. (spatstat's `rpoispp()` in R gets the same kind of random pattern by a different
+route.)
+
+```{python}
+def sample_ipp(lam, env, rng):
+    """Sample points from an inhomogeneous Poisson process whose intensity is the map `lam`
+    (expected points per square degree; nan = outside the region)."""
+    mean_counts = np.nan_to_num(lam) * env.res**2          # expected number of points in each cell
+    counts = rng.poisson(mean_counts)                       # how many points land in each cell
+    row, col = np.nonzero(counts)                           # the cells that got at least one point
+    n_per_cell = counts[row, col]
+    x_centre, y_centre = env.xy(np.repeat(row, n_per_cell), np.repeat(col, n_per_cell))
+    n = n_per_cell.sum()
+    # place each point uniformly at random within its cell
+    x = x_centre + rng.uniform(-0.5, 0.5, size=n) * env.res
+    y = y_centre + rng.uniform(-0.5, 0.5, size=n) * env.res
+    return pd.DataFrame({"x": x, "y": y})
+```
+
+You can run this cell repeatedly to see samples from the IPP (`default_rng()` with no seed gives new
+random numbers each time):
+
+```{python}
+scale_factor = 25   # Experimenting with scaling. Without dividing, the map is crowded with points.
+rng = np.random.default_rng()
+ipp_samp = sample_ipp(lambda_map / scale_factor, env_stack, rng)   # sample from the IPP
+
+ax = sdm.plot_map(lambda_map / scale_factor, env_stack, cmap="YlGn",
+                  title=f"IPP sample with {len(ipp_samp)} points")   # plot the (scaled) lambda as a base
+ax.scatter(ipp_samp["x"], ipp_samp["y"], s=3, color="red");          # add the sampled points on top in red
+```
+
+The number of points that are generated is Poisson distributed with mean equal to the integral of the
+intensity over the entire domain. If you sample a few times, you might believe that the numbers are
+coming from a Poisson distribution with that mean. Let's check with ten draws (a *list
+comprehension*, `[... for i in range(10)]`, repeats the expression ten times and collects the
+results in a list):
+
+```{python}
+expected_count = np.nansum(lambda_map / scale_factor) * cell_area
+counts = [len(sample_ipp(lambda_map / scale_factor, env_stack, rng)) for i in range(10)]
+print("counts       :", counts)
+print("expected     :", round(expected_count, 1))
+print("mean of draws:", np.mean(counts), "  sd of draws:", round(np.std(counts, ddof=1), 1),
+      "  Poisson sd:", round(np.sqrt(expected_count), 1))
+```
+
+This is why the scaling matters too: dividing λ by `scale_factor` divides the expected count by the
+same amount.
+
+> **The units of area matter.** λ is a rate *per unit area*, so its values only mean something once
+> the units of area are fixed. If we measured area in pixels (each cell 1 × 1), the expected count
+> would simply be the *sum* of the cell values (about 815,000 here, before scaling). In square
+> degrees each cell is 1/36, so the same values give 36 times fewer points. A square degree isn't a
+> fixed area on the ground, either: it shrinks toward the poles.
+
+We might think of a background sample as coming from a homogeneous Poisson process instead. Sampling
+the entire geographic area regardless of the species intensity.
+
+```{python}
+bkgd_map = np.where(np.isnan(lambda_map), np.nan, 0.3)   # You can play with the constant here to see how it changes the number of points
+bkgd_samp = sample_ipp(bkgd_map, env_stack, rng)
+
+ax = sdm.plot_map(bkgd_map, env_stack, cmap="Greys", vmin=0, vmax=1, colorbar=False,
+                  title=f"Background sample with {len(bkgd_samp)} points")
+ax.scatter(bkgd_samp["x"], bkgd_samp["y"], s=3, color="blue");
+
+land_area = np.sum(~np.isnan(lambda_map)) * cell_area
+print("land area:", round(land_area), "square degrees;  expected points:", round(0.3 * land_area))
+```
+
+For a constant intensity, the integral is just the constant times the area of the region. In Maxent
+(Lab 6), background points play this role: a sample of the available environments that is used to
+approximate the integral of λ over the region (Renner et al. 2015).

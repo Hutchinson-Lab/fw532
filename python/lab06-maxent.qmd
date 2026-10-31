@@ -1,0 +1,437 @@
+---
+title: "Lab 6: Maxent"
+subtitle: "FW 532 · Python version"
+---
+
+**Goals:** To get familiar with Maxent, run some models in Java and Python, and look at sensitivity
+to some of the parameters.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* The Maxent Java application (see below; it needs Java installed on your computer)
+* Python packages: numpy, pandas, matplotlib, scikit-learn, rasterio, elapid (see `requirements.txt`)
+* The course helper module `sdmlab.py` (in the same folder as this notebook)
+
+Remember to run the cells in order from top to bottom.
+
+Download Maxent version 3.4.4 [here](https://biodiversityinformatics.amnh.org/open_source/maxent/).
+We will be working largely from the Maxent
+[tutorial](https://biodiversityinformatics.amnh.org/open_source/maxent/Maxent_tutorial_2021.pdf).
+
+In this lab, you will generate data similarly to the other labs, and model it with the Maxent
+software following the steps in the tutorial. That is, you will replicate the steps of the tutorial
+using your own simulated data instead of (or in addition to) the data provided with the tutorial.
+
+> **Using Colab?** The Maxent Java app runs on your own computer, not in Colab. If you run this
+> notebook in Colab, download the files it writes (the `output/lab06` folder, see below) to your
+> computer before you start the Java part.
+
+```{python}
+# Running on Google Colab? This cell downloads the course files. (Anywhere else it does nothing.)
+import os, sys
+if "google.colab" in sys.modules:
+    if not os.path.exists("/content/fw532"):
+        !git clone -q --depth 1 https://github.com/Hutchinson-Lab/fw532.git /content/fw532
+        %pip install -q rasterio elapid
+    os.chdir("/content/fw532/python")
+```
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, roc_auc_score
+import elapid                  # Maxent in Python
+
+import sdmlab as sdm           # course helpers for rasters
+```
+
+# Generate Data
+
+This section is almost identical to our data generation from the early labs with the linear
+functions of covariates. The main difference is that we will only keep the presence points we
+generate, since we are simulating presence-only data. We will write these locations out to a file to
+be loaded into Maxent. We will also convert our environmental layers to ascii instead of tif format
+for Maxent.
+
+Set-up: everything this lab writes goes in the `output/lab06/` folder of the course project.
+`sdm.output_dir()` creates the folder and returns its path. Paths in Python are `Path` objects, and
+the `/` operator joins path pieces, e.g. `out_dir / "asciiRasters"`.
+
+```{python}
+env_stack = sdm.load_env()
+
+out_dir = sdm.output_dir("lab06")
+ascii_dir = sdm.output_dir("lab06", "asciiRasters")
+sdm.output_dir("lab06", "maxentOutput")   # an empty folder for the Java app's results
+print(out_dir)
+```
+
+Write out these rasters for Maxent to use. This takes a few seconds. The `for` loop runs the indented
+line once for each layer name, and `f"{name}.asc"` (an *f-string*) puts the name into the file name.
+
+```{python}
+# Write them back out in a new directory in ascii format
+for name in env_stack.names:
+    sdm.write_ascii_grid(env_stack[name], env_stack, ascii_dir / f"{name}.asc")
+
+sorted(p.name for p in ascii_dir.glob("*.asc"))
+```
+
+An `.asc` file is plain text: a six-line header, then one line of numbers per row of the raster.
+Here is the header of one of them:
+
+```{python}
+with open(ascii_dir / "elevation.asc") as f:
+    for i in range(6):
+        print(f.readline(), end="")
+```
+
+The header gives the number of columns and rows, the coordinates of the lower-left corner, the cell
+size (in degrees), and the code for missing values (ocean cells). Maxent requires all the layers to
+have identical headers, which ours do because they come from one raster stack. Values are written
+with 6 significant digits.
+
+# Simulate Data
+
+We will use simulated data again in the exercises below. This is the same virtual species as in
+Lab 1 (and the same random seeds, so the same sites).
+
+```{python}
+# define logistic function
+def logistic(x):
+    return np.exp(x) / (1 + np.exp(x))
+
+# get points
+n_points = 1000
+sim_pts = env_stack.sample_random(n_points, seed=1234)
+
+# set parameters
+intercept = -1.5
+beta1 = -1.5
+beta2 = -1.5
+beta3 = 1.5
+p_occ = logistic(intercept
+                 + beta1 * sdm.scale(env_stack["Precipitation.Seasonality"])            # 15
+                 + beta2 * sdm.scale(env_stack["Min.Temperature.of.Coldest.Month"])     # 6
+                 + beta3 * sdm.scale(env_stack["Mean.Temperature.of.Wettest.Quarter"])) # 8
+
+# get the values that correspond to the points we selected:
+p_occs = sdm.extract(p_occ, env_stack, sim_pts["x"], sim_pts["y"])
+
+# sample from these probabilities (with a *different* seed; see Lab 1):
+rng = np.random.default_rng(5678)
+pres_abs = rng.binomial(n=1, p=p_occs)
+
+# put response and variables together in a DataFrame:
+modeling_df = sim_pts.copy()
+modeling_df.insert(0, "presAbs", pres_abs)
+
+# plot the result
+is_pres = pres_abs == 1
+ax = sdm.plot_map(p_occ, env_stack, title="pOcc")
+ax.scatter(sim_pts.loc[is_pres, "x"], sim_pts.loc[is_pres, "y"], s=6, color="red");
+```
+
+Write these locations to a file for Maxent. Maxent wants three columns, in this order: the species
+name, the x coordinate (longitude), and the y coordinate (latitude).
+
+```{python}
+print(is_pres.sum(), "of the", n_points, "sites are presences")
+
+pres_file = pd.DataFrame({"species": "simSpp",
+                          "x": sim_pts.loc[is_pres, "x"],
+                          "y": sim_pts.loc[is_pres, "y"]})
+pres_file.to_csv(out_dir / "simSppPres.csv", index=False)
+
+pd.read_csv(out_dir / "simSppPres.csv").head(3)
+```
+
+# Maxent
+
+At this point, switch over to the Java app to run Maxent on these data.
+
+> **Where are the files?** Everything Maxent needs is now in the `output/lab06/` folder of your
+> course project (the full path is printed in the set-up cell above). In the Maxent window:
+>
+> * **Samples:** `output/lab06/simSppPres.csv`
+> * **Environmental layers:** the folder `output/lab06/asciiRasters` (choose the folder itself, not
+>   the files inside it). All 20 layers are continuous.
+> * **Output directory:** the empty folder `output/lab06/maxentOutput`
+> * **Test sample file** (on the Settings panel, for the section below): `output/lab06/simSppTestPres.csv`
+
+With the Java app, follow the Maxent tutorial using the data you generated through these sections:
+
+* Getting started
+* Doing a run
+* Looking at a prediction
+    + In this section, try the suggestion in the tutorial to use a random seed for the test set. In
+      addition, try supplying your own test set. Code to generate a test set for the simulated
+      species is provided below.
+
+```{python}
+# same data generation with new random seeds
+test_pts = env_stack.sample_random(n_points, seed=4321)
+
+# get the probabilities that correspond to the points we selected:
+test_probs = sdm.extract(p_occ, env_stack, test_pts["x"], test_pts["y"])
+
+# sample from these probabilities (again, a seed we haven't used yet):
+rng = np.random.default_rng(8765)
+test_resp = rng.binomial(n=1, p=test_probs)
+
+# plot the result
+is_test_pres = test_resp == 1
+ax = sdm.plot_map(p_occ, env_stack, title="pOcc")
+ax.scatter(sim_pts.loc[is_pres, "x"], sim_pts.loc[is_pres, "y"], s=6, color="red",
+           label="training presences")
+ax.scatter(test_pts.loc[is_test_pres, "x"], test_pts.loc[is_test_pres, "y"], s=6, color="blue",
+           label="test presences")
+ax.legend(loc="lower left");
+
+test_file = pd.DataFrame({"species": "simSpp",
+                          "x": test_pts.loc[is_test_pres, "x"],
+                          "y": test_pts.loc[is_test_pres, "y"]})
+test_file.to_csv(out_dir / "simSppTestPres.csv", index=False)
+```
+
+Note that Maxent stores the predictions for these test points in an output file that ends with
+samplePredictions.csv in the output directory. You could read these back into Python (with
+`pd.read_csv()`) for further processing/evaluation if desired.
+
+Continue through the tutorial sections:
+
+* Output formats
+    + Create plots of each of the output formats for the simulated species.
+* Statistical analysis
+
+> **Question:** **Suggested discussion point:** Describe each output format: what it shows and how
+> they differ. Which seems most useful to you, in what context?
+
+In the next sections, you will do some model interpretation. Since you are working with simulated
+data, you KNOW which variables should show up as important and what their relationships to the
+prediction should be. In this example with all variables, you may find that the Maxent output
+doesn't represent the model you used to simulate the data very well.
+
+> **Question:** **Suggested discussion question:** Why might this be the case? How do the results
+> change if you ONLY include the relevant predictors? with just one irrelevant predictor that is
+> minimally correlated with the true variables? with only linear features (since the true model is
+> linear)?
+
+> **Exercise:** Do the following four sections of the tutorial with different settings to explore
+> these questions.
+>
+> * Which variables matter most?
+> * How does the prediction depend on the variables?
+> * Feature types and response curves
+> * Interactive exploration of predictions
+
+There is SO much more we could do, but we'll stop there for now. Browse through the rest of the
+tutorial to get a sense of what else it offers for future reference!
+
+## Note: Supplying your own background points to deal with sampling bias
+
+One other thing you may want to do with Maxent is to supply your own background points instead of
+having them sampled randomly from the rasters you provide. You might do this if you want your
+background points to reflect the same sampling bias as the presence points (see the Phillips et al
+(2009) reference at the bottom of this lab) so the bias 'factors out.' The background could be drawn
+from a known sampling effort distribution (or this could be provided to the Maxent software as a
+bias file), or from opportunistic records of similar species that were likely sampled with the same
+bias (i.e. an empirical sample from the effort distribution). You could simulate this by sampling
+background data from the rasters above in Python, similarly to how we sampled presences (but without
+consulting the probability of occurrence). To supply background points to the Java app, you need to
+use the SWD format (a section of the tutorial we didn't get to). (In R, you can also supply them
+through the dismo::maxent interface using its 'a' argument.) Finally, the 'elapid' package (below)
+requires background points, even if they are randomly sampled.
+
+# Running with the 'elapid' package
+
+elapid does not include ALL the functions of the Java version. But, it may be nice sometimes to run
+Maxent within Python for comparison with other approaches or for other processing.
+
+elapid's `MaxentModel` follows the approach of the R package maxnet (Phillips et al. 2017): it builds
+the same kinds of features (linear, quadratic, product, hinge, threshold) and fits Maxent as a
+logistic regression of presences vs. background points in which each background point gets a large
+weight (100). A few differences from maxnet (the R version of this lab) are worth knowing:
+
+* elapid's defaults are different (linear, hinge, and product features; `beta_multiplier=1.5`), so
+  below we set `feature_types` and `beta_multiplier` to match maxnet's defaults for 80 or more
+  presences (linear, quadratic, product, hinge; regularization multiplier 1).
+* By default elapid fits the model with scikit-learn's L1-penalized (lasso) logistic regression,
+  using one penalty for all features. maxnet (and the Java app) give each feature its own penalty.
+  elapid uses 10 hinge knots per variable, maxnet 50.
+
+So expect similar, but not identical, results.
+
+# Simulate presence-background data for elapid
+
+We use the same seeds as above for the sites (1234) and the coin flips (5678), so these are the same
+presences you gave the Java app. The background points get a seed of their own.
+
+```{python}
+# define logistic function
+def logistic(x):
+    return np.exp(x) / (1 + np.exp(x))
+
+# get points
+n_points = 1000
+n_background = 2000
+sim_pts = env_stack.sample_random(n_points, seed=1234)
+background = env_stack.sample_random(n_background, seed=2468)
+
+# set parameters
+intercept = -1.5
+beta1 = -1.5
+beta2 = -1.5
+beta3 = 1.5
+p_occ = logistic(intercept
+                 + beta1 * sdm.scale(env_stack["Precipitation.Seasonality"])
+                 + beta2 * sdm.scale(env_stack["Min.Temperature.of.Coldest.Month"])
+                 + beta3 * sdm.scale(env_stack["Mean.Temperature.of.Wettest.Quarter"]))
+
+# get the values that correspond to the points we selected:
+p_occs = sdm.extract(p_occ, env_stack, sim_pts["x"], sim_pts["y"])
+
+# sample from these probabilities:
+rng = np.random.default_rng(5678)
+pres = rng.binomial(n=1, p=p_occs)
+
+# put response and variables together in a DataFrame
+# (pd.concat stacks the presence rows on top of the background rows):
+pred_vars = env_stack.names   # the 20 environmental variables
+modeling_df = pd.concat([sim_pts[pres == 1].assign(presBkgrnd=1),
+                         background.assign(presBkgrnd=0)],
+                        ignore_index=True)
+
+# plot the result
+ax = sdm.plot_map(p_occ, env_stack, title="pOcc")
+ax.scatter(background["x"], background["y"], s=4, color="blue")
+ax.scatter(sim_pts.loc[pres == 1, "x"], sim_pts.loc[pres == 1, "y"], s=4, color="red");
+```
+
+Here is a demo with the main elapid functions. This is on the whole modeling DataFrame, so you can
+consider predicting to independent test data as an exercise (optional).
+
+To change the settings, use `beta_multiplier` (the regularization multiplier) and `feature_types`
+(e.g. `["linear", "quadratic"]`). `transform="cloglog"` sets the output format of `predict()`
+(the other options are `"raw"` and `"logistic"`).
+
+```{python}
+maxent_model = elapid.MaxentModel(feature_types=["linear", "quadratic", "product", "hinge"],
+                                  beta_multiplier=1.0,
+                                  transform="cloglog",
+                                  random_state=42)   # the fitting algorithm uses random numbers too
+maxent_model.fit(modeling_df[pred_vars], modeling_df["presBkgrnd"])
+
+n_used = np.sum(maxent_model.beta_scores_ != 0)
+print(n_used, "of", len(maxent_model.beta_scores_), "features have non-zero coefficients")
+```
+
+Response curves. To mirror maxnet's `plot()`, we vary one variable at a time over its range (plus 10%
+on each side) and hold all the other variables at their mean over the presence and background
+points. (elapid also has `maxent_model.partial_dependence_plot(X)`, which instead *averages* the
+predictions over all the rows of `X`, a partial dependence plot; we'll meet those in a later lab.)
+
+```{python}
+def response_curve(model, data, var, transform="cloglog", n=100):
+    """Predictions along one variable, with the other variables held at their means."""
+    sweep = pd.DataFrame([data.mean()] * n)          # n copies of the row of means
+    lo, hi = data[var].min(), data[var].max()
+    sweep[var] = np.linspace(lo - 0.1 * (hi - lo), hi + 0.1 * (hi - lo), n)
+    if transform == "link":                          # the linear predictor = log of the raw output
+        model.set_params(transform="raw")
+        preds = np.log(model.predict(sweep))
+    else:
+        model.set_params(transform=transform)
+        preds = model.predict(sweep)
+    model.set_params(transform="cloglog")            # back to our default
+    return sweep[var], preds
+
+fig, axes = plt.subplots(4, 5, figsize=(15, 11), constrained_layout=True)
+for ax, var in zip(axes.flat, pred_vars):
+    xs, preds = response_curve(maxent_model, modeling_df[pred_vars], var)
+    ax.plot(xs, preds, color="black")
+    ax.set_ylim(0, 1)
+    ax.set_xlabel(var, fontsize=8)
+    ax.set_ylabel("cloglog")
+```
+
+Individual effects:
+
+```{python}
+xs, preds = response_curve(maxent_model, modeling_df[pred_vars],
+                           "Mean.Temperature.of.Wettest.Quarter", transform="link")
+fig, ax = plt.subplots(figsize=(7, 4.5))
+ax.plot(xs, preds, color="black")
+ax.set_xlabel("Mean.Temperature.of.Wettest.Quarter")
+ax.set_ylabel("link (the linear predictor)");
+```
+
+Prediction function example, but used on the same data that the model was fitted on. (pROC in the R
+version plots specificity on a reversed x-axis; here we plot the false positive rate,
+1 − specificity, so the curves look the same.)
+
+```{python}
+maxent_preds = maxent_model.predict(modeling_df[pred_vars])
+
+fpr, tpr, thresholds = roc_curve(modeling_df["presBkgrnd"], maxent_preds)
+fig, ax = plt.subplots(figsize=(5, 5))
+ax.plot(fpr, tpr, color="black")
+ax.plot([0, 1], [0, 1], color="grey", linestyle="--")
+ax.set_xlabel("False positive rate (1 - specificity)")
+ax.set_ylabel("True positive rate (sensitivity)")
+ax.set_aspect("equal")
+print("AUC:", round(roc_auc_score(modeling_df["presBkgrnd"], maxent_preds), 4))
+```
+
+Note that this AUC compares presences with *background* points, not absences (some background points
+fall where the species is present), and it is computed on the training data.
+
+We can also predict to every cell and compare the predicted map with the truth:
+
+```{python}
+grid = env_stack.to_frame()   # one row per land cell
+maxent_map = env_stack.to_map(maxent_model.predict(grid[pred_vars]), index=grid.index)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 4), constrained_layout=True)
+sdm.plot_map(p_occ, env_stack, ax=axes[0], title="True probability of occurrence", vmin=0, vmax=1)
+sdm.plot_map(maxent_map, env_stack, ax=axes[1], title="elapid prediction (cloglog)", vmin=0, vmax=1);
+```
+
+Compare where the prediction is high and low, rather than the values themselves. Presence-only data
+can't tell a model how common the species is (prevalence is not identifiable), so the cloglog scale
+rests on an assumption rather than on the data.
+
+# Turn in
+
+**(on Canvas, by the due date on Canvas)** Please post to the online discussion of this lab. Please
+include brief descriptions of your exploration of the exercises, with any relevant plots. Please also
+include, if applicable:
+
+* Any key take-aways from this lab that you want to remember for any future projects you may conduct
+  in which you use species distribution models.
+* Any remaining questions or confusions do you have that you might like to learn more about.
+
+# Further Resources
+
+See the tutorials and papers linked from the software page at the top of the lab. I'll add a few
+more:
+
+Renner, I. W., Elith, J., Baddeley, A., Fithian, W., Hastie, T., Phillips, S. J., Popovic, G., &
+Warton, D. I. (2015). Point process models for presence-only analysis. *Methods in Ecology and
+Evolution*, 6(4), 366–379. <https://doi.org/10.1111/2041-210X.12352>
+
+Yackulic, C. B., Chandler, R., Zipkin, E. F., Royle, J. A., Nichols, J. D., Campbell Grant, E. H.,
+& Veran, S. (2013). Presence-only modelling using MAXENT: when can we trust the inferences?
+*Methods in Ecology and Evolution*, 4(3), 236–243. <https://doi.org/10.1111/2041-210x.12004>
+
+Phillips, S. J., Dudík, M., Elith, J., Graham, C. H., Lehmann, A., Leathwick, J., & Ferrier, S.
+(2009). Sample selection bias and presence-only distribution models: implications for background and
+pseudo-absence data. *Ecological Applications*, 19(1), 181–197. <https://doi.org/10.1890/07-2153.1>
+
+Phillips, S. J., Anderson, R. P., Dudík, M., Schapire, R. E., & Blair, M. E. (2017). Opening the
+black box: an open-source release of Maxent. *Ecography*, 40(7), 887–893.
+<https://doi.org/10.1111/ecog.03049>
+
+elapid documentation: <https://earth-chris.github.io/elapid/>

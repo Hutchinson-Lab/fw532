@@ -1,0 +1,46 @@
+---
+title: "Syllabus & schedule"
+subtitle: "Fall 2026"
+---
+
+::: {.callout-important title="Canvas is the official source"}
+Dates below are **tentative**. They follow last year's calendar shifted to Fall 2026. Due dates, the full syllabus, and university policies are on Canvas.
+:::
+
+## Course essentials
+
+* **Instructor:** Prof. Rebecca Hutchinson. Office hours by appointment; please reach out.
+* **Meetings:** Tuesdays and Thursdays (time and room on Canvas).
+* **Credits:** 3
+* **Prerequisites:** Graduate standing and some prior programming experience. Labs are offered in R and in Python; see [Get set up](setup.qmd).
+* **Textbook:** None. Readings are provided (see [Readings](readings.qmd)).
+
+### How you'll be assessed
+
+| Component | Weight | What it involves |
+|---|---:|---|
+| Discussions | 30% | A post on (usually) one paper before each class meeting. Assesses learning outcomes 1–2. |
+| Hands-on exercises | 30% | The [labs](labs/index.qmd); you report on each one in a Canvas discussion post. Assesses outcomes 2–3. |
+| Term project | 40% | Build an SDM either on simulated data provided by the instructor (evaluated on withheld data) or on your own data. Includes a proposal, progress report, peer review, presentation, and final report. Assesses outcomes 3–4. |
+
+Labs are usually due at 11:59 pm on the Wednesday after they're introduced. Late work: 0–24 hours late earns 90% credit and 24–48 hours late earns 50%. Contact the instructor about special circumstances.
+
+**Generative AI:** use it judiciously to support the learning process, never to supplant it. See the AI guidance document on Canvas for specifics.
+
+## Schedule
+
+| Week | Tuesday | Thursday | Lab due (Wed) | Project |
+|:--|:--|:--|:--|:--|
+| **0** (Sep 24) | — | Intro to SDMs · *Elith & Leathwick 2009* | | |
+| **1** (Sep 29 / Oct 1) | Types of data · *Guillera-Arroita et al. 2015* | Evaluation metrics | [Lab 1](labs/01-simulation.qmd) · Sep 30 | |
+| **2** (Oct 6 / 8) | Cross-validation · *Liu et al. 2011; Roberts et al. 2017* | Intro to trees | [Lab 2](labs/02-evaluation.qmd) · Oct 7 | |
+| **3** (Oct 13 / 15) | Random forests · *Cutler et al. 2007* | RFs for presence-only data · *Valavi et al. 2021* | [Lab 3](labs/03-cart.qmd) · Oct 14 | Proposal due Mon Oct 12 |
+| **4** (Oct 20 / 22) | Algorithmic paradigms · *Breiman 2001* | Boosted regression trees · *Elith et al. 2008* | [Lab 4](labs/04-random-forests.qmd) · Oct 21 | |
+| **5** (Oct 27 / 29) | Project checkpoint | Project checkpoint | | Progress-report video due Mon Nov 2 |
+| **6** (Nov 3 / 5) | Model comparison incl. RFs & BRTs · *Valavi et al. 2022* | Inhomogeneous Poisson processes · *Renner et al. 2015* | [Lab 5](labs/05-brt.qmd) · Nov 4 | Peer reviews due Mon Nov 9 |
+| **7** (Nov 10 / 12) | *TBA* | Maxent · *Elith et al. 2011* | | |
+| **8** (Nov 17 / 19) | Neural networks | Graph neural networks · *Harrell et al. 2025* | [Lab 6](labs/06-maxent.qmd) · Nov 18 | Progress report due Thu Nov 19 |
+| **9** (Nov 24 / 26) | Demo & follow-up · *Fourcade et al. 2018; Warren et al. 2021* | No class: Thanksgiving | | |
+| **10** (Dec 1 / 3) | Project presentations | Project presentations | | Final report due Mon Dec 7 |
+
+Optional extras: the [bonus neural-network lab](labs/07-neural-networks.qmd) (Week 8) and the [demos](labs/demos.qmd) used in class.

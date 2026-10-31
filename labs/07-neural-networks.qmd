@@ -1,0 +1,164 @@
+---
+title: "Bonus Lab 7: Artificial Neural Networks (ANN)"
+subtitle: "A flexible function with many knobs, and how to keep it from fitting the noise"
+description: "Optional lab. Fit small neural networks to a simulated species, watch them overfit, rein them in with fewer hidden units, fewer variables, or earlier stopping, and probe them with generalized weights and permutation importance."
+image: images/lab07.png
+order: 7
+---
+
+::: {.lab-meta}
+[Week 8 · optional]{} [Related reading: Harrell et al. (2025)]{} [Methods: neural networks, permutation importance]{} [R · Python]{}
+:::
+
+## Why this lab?
+
+Neural networks power most of modern machine learning, and they are starting to appear in species distribution modeling, especially where the inputs are images, sounds, or many species at once. Before you meet the deep versions, it helps to understand the small ones. A network with one hidden layer is just a formula: a few logistic regressions whose outputs feed into one more logistic regression. Everything that makes deep learning powerful and tricky (flexibility, many parameters, random starting points, iterative fitting) is already there.
+
+That flexibility cuts both ways. With 20 climate variables and six hidden units, a network has 133 weights to estimate from 500 training points, so it can fit the training data very closely, noise included. This lab shows what overfitting looks like in a neural network (huge weights, a big gap between training and test AUC, maps full of 0s and 1s) and three ways to control it.
+
+Networks are also hard to read: no single weight means much on its own. The second half of the lab tries two ways to see inside one, generalized weights and permutation importance. Because the species is simulated, you can check what they show against the truth.
+
+This is a **bonus lab**. It goes with the neural networks lecture and isn't required.
+
+## Key concepts
+
+### Neurons, hidden units, and activation functions
+
+A *neuron* (or *unit*) takes a weighted sum of its inputs plus a bias (intercept) and passes it through an *activation function*. With the logistic (sigmoid) activation, every unit is a little logistic regression. Units are arranged in *layers*: the inputs (our environmental variables), one or more *hidden* layers, and an output.
+
+```{mermaid}
+%%| fig-width: 7
+flowchart LR
+  X1["x₁: Mean.Diurnal.Range"] --> H1(("h₁"))
+  X1 --> H2(("h₂"))
+  X1 --> H3(("h₃"))
+  X2["x₂: Isothermality"] --> H1
+  X2 --> H2
+  X2 --> H3
+  X3["… 20 inputs"] --> H1
+  X3 --> H2
+  X3 --> H3
+  H1 --> O(("output<br/>p̂"))
+  H2 --> O
+  H3 --> O
+```
+
+For one hidden layer with $H$ units and inputs $x_1, \dots, x_p$:
+
+$$
+h_j = \sigma\Big(b_j + \sum_{i=1}^{p} w_{ij}\, x_i\Big), \qquad
+\hat p = \sigma\Big(c + \sum_{j=1}^{H} v_j\, h_j\Big), \qquad
+\sigma(z) = \frac{1}{1 + e^{-z}}.
+$$
+
+The $w_{ij}$ (input → hidden) and $v_j$ (hidden → output) are the *weights*; $b_j$ and $c$ are the biases. Other common activations are tanh and ReLU (rectified linear unit, $\max(0, z)$), which is the default in most deep learning. This lab uses the logistic activation throughout.
+
+### A network is a flexible nonlinear function
+
+::: {.concept}
+**Logistic regression is a neural network with no hidden layer.** Remove the hidden layer and the output is $\sigma(c + \sum_i v_i x_i)$, which is exactly a logistic regression. Adding hidden units lets the network combine the inputs in nonlinear ways: each hidden unit is a smooth "step" along some direction in environmental space, and the output layer adds these steps together on the log-odds scale.
+:::
+
+With enough hidden units, a single hidden layer can approximate any continuous function as closely as you like (the *universal approximation* theorem). The catch is in "enough": you may need many hidden units and a lot of data. The simulated species in this lab has a quadratic effect and an interaction, things a logistic regression can't capture unless you write those terms in yourself. A network can learn them without being told, but only if it has the data to tell signal from noise.
+
+### Weights and how training works
+
+Training means finding weights that make the predictions match the data. We choose an *error* (or *loss*) function and minimize it with a gradient-based algorithm. *Backpropagation* is the chain-rule bookkeeping that computes the gradient of the error with respect to every weight, layer by layer. The two versions of the lab use different losses and optimizers:
+
+| | R: `neuralnet` | Python: `MLPClassifier` |
+|---|---|---|
+| Error minimized | sum of squared errors (default `err.fct = "sse"`; `"ce"` for cross-entropy) | cross-entropy (log-loss), i.e. the binomial deviance ÷ 2n |
+| Optimizer | resilient backpropagation (`rprop+`) | L-BFGS (`solver = "lbfgs"`) |
+| Starting weights | standard normal random numbers | small uniform random numbers |
+| Stops when | largest gradient < `threshold`, or `stepmax` steps | largest gradient < `tol`, loss stops improving, or `max_iter` |
+| Weight decay | none | `alpha` (we set 0 to match R) |
+
+The error surface of a network has many local minima, and where training ends up depends on where it starts. Starting weights are random, so **set a seed** to make results reproducible. Then remember that a different seed is a different model. Sometimes the algorithm doesn't reach its stopping rule in the allowed number of steps. neuralnet then warns "did not converge" and returns no weights. The lab explains what to do.
+
+### Overfitting and complexity control
+
+A network with $p$ inputs and $H$ hidden units has $(p+1)H + (H+1)$ parameters: 133 for $p = 20, H = 6$. Left alone, the optimizer will keep growing the weights to fit the training points better. Large weights turn the smooth logistic units into sharp steps, so the network carves environmental space into regions of near-0 and near-1 predictions. The lab looks at three knobs, and a fourth is worth knowing:
+
+| Knob | In R (`neuralnet`) | In Python (`MLPClassifier`) |
+|---|---|---|
+| **Architecture size** (fewer hidden units or layers) | `hidden = c(3)` | `hidden_layer_sizes = (3,)` |
+| **Input variables** (drop redundant ones) | edit the formula | pass fewer columns |
+| **Stop training earlier** | larger `threshold` | larger `tol` (or smaller `max_iter`) |
+| **Weight decay** (penalize large weights, like ridge regression) | not available in neuralnet; `nnet::nnet(..., decay = )` has it | `alpha > 0` |
+
+The lab's "early stopping" just stops the optimizer sooner. In the deep learning literature, *early stopping* usually means monitoring error on a held-out validation set and stopping when it starts to rise. Either way, the amount of training is a tuning parameter, and like any tuning parameter it should be chosen with data the model wasn't trained on, e.g. by cross-validation.
+
+### Why scaling the inputs matters
+
+Each hidden unit sees $b_j + \sum_i w_{ij} x_i$. If one variable is in millimetres of rain (hundreds to thousands) and another in °C (tens), the same weight means very different things for each. Large raw values also push the logistic function into its flat tails, where gradients vanish and training stalls. Standardizing every input to mean 0 and SD 1 puts them on a common footing and makes the starting weights sensible.
+
+::: {.concept}
+**Scale once, use everywhere.** The transformation used for prediction must be the same one used for training. In this lab we standardize the whole raster stack once, then both sample training points from it and predict onto it. Standardizing the training points with their own means and SDs and the map with the map's means and SDs feeds the model slightly different inputs at prediction time than it saw during training.
+:::
+
+### Looking inside the network
+
+Individual weights are hard to interpret. Hidden units can be reordered without changing the model, and the signs of a unit's weights can flip together. Instead, we ask how the *output* responds to each input:
+
+* **Generalized weights** (Intrator & Intrator, 2001): for variable $x_i$ at data point $x$, the slope of the predicted log-odds,
+  $\tilde w_i(x) = \partial \log\big(\hat p / (1-\hat p)\big) / \partial x_i$.
+  In logistic regression this would be the same number ($\beta_i$) at every point. In a network it varies, and a wide spread signals a nonlinear effect or an interaction. In our simulated species, the true slope for Isothermality is $\beta_2 + \beta_5 \times$ Mean.Temperature.of.Wettest.Quarter, so it really does vary from place to place. R's `gwplot()` plots these. In Python we compute them by finite differences.
+* **Permutation importance**: shuffle one variable, breaking its link to the response, and see how much AUC drops. It works for any model (you met it with random forests in Lab 4). Note that correlated variables can stand in for each other, so dropping one may cost little.
+* **Partial dependence plots**: average the prediction over the data while varying one variable. They work for networks just as for random forests (see Lab 4 and the model comparison demo).
+
+### Beyond small networks: deep learning in SDM
+
+*Deep* networks stack many layers, and each layer builds features from the layer below (in images, edges → parts → objects). They shine when the raw inputs are high-dimensional and structured. In SDM, convolutional neural networks (CNNs) have been used to predict species from satellite or aerial imagery around each site, and multi-species networks predict many species at once from shared features.
+
+Harrell et al. (2025) take a different route with **graph neural networks** (GNNs). Species and locations are two kinds of nodes in a graph, and each detection record is an edge linking a location to a species. The model learns representations of both by passing information along those edges, and predicts whether an unseen location–species edge should exist (link prediction). On the six-region presence-only benchmark used by Valavi et al. (2022), their proof-of-concept GNN was comparable to or better than the best previously benchmarked single-species methods in five of six regions. The authors note an important caveat: their models are trained on all species jointly, which likely accounts for part of the gain. This is a workshop paper and an active research area, not yet a standard tool.
+
+For most tabular SDM problems (a few dozen environmental variables, hundreds to thousands of records), small networks have no clear advantage over well-tuned boosted trees or random forests, and they take more care to fit. Their strengths lie elsewhere: raw imagery, many species at once, and complex data structures.
+
+## What you'll do
+
+1. Simulate a species with a quadratic effect and an interaction, from a standardized raster stack.
+2. Fit a network with one hidden layer of six units and all 20 variables, and compare training and test AUC.
+3. Map its predictions next to the truth and look for signs of overfitting.
+4. Rein it in three ways: fewer hidden units, fewer input variables, and stopping training earlier.
+5. Interpret the network with generalized weights and permutation importance.
+6. **Exercise:** find a better network, think about tuning it with cross-validation, and try a null distribution for permutation importance.
+
+## Get the starter code
+
+Both versions do the same analysis step by step. Pick the language you're learning (or try both!). New to the course? Start with [Get set up](../setup.qmd).
+
+::: {.starter-code}
+::: {.track}
+#### R
+
+[Read the R lab](../r/lab07-neural-networks.qmd){.btn .btn-primary}
+[R starter kit (.zip)](../downloads/fw532-R-labs.zip){.btn .btn-outline-primary}
+
+In the kit, open `fw532.Rproj`, then `r/lab07-neural-networks.qmd`. Uses **terra**, **neuralnet**, and **pROC**.
+:::
+
+::: {.track .python}
+#### Python
+
+[Read the Python lab](../python/lab07-neural-networks.qmd){.btn .btn-primary}
+[Open in Colab](https://colab.research.google.com/github/Hutchinson-Lab/fw532/blob/main/python/lab07-neural-networks.ipynb){.btn .btn-outline-primary}
+[Python starter kit (.zip)](../downloads/fw532-python-labs.zip){.btn .btn-outline-primary}
+
+Open `python/lab07-neural-networks.ipynb`. Uses **numpy**, **pandas**, **matplotlib**, and **scikit-learn**.
+:::
+:::
+
+## Turn in
+
+If this lab is assigned: post to the Canvas discussion for this lab by the due date on Canvas. Include brief descriptions of your exploration of the exercise, with any relevant plots. If applicable, also include:
+
+* key take-aways you'd want to remember for a future SDM project, and
+* remaining questions or confusions you'd like to learn more about.
+
+## Readings & resources
+
+* Harrell, L., Kaeser-Chen, C., Karagol Ayan, B., et al. (2025). Heterogenous graph neural networks for species distribution modeling. Workshop paper, *Tackling Climate Change with Machine Learning*, ICLR 2025. <https://arxiv.org/abs/2503.11900>
+* Nielsen, M. A. *Neural Networks and Deep Learning* (free online book). <http://neuralnetworksanddeeplearning.com/>
+* Lek, S., & Guégan, J. F. (1999). Artificial neural networks as a tool in ecological modelling, an introduction. *Ecological Modelling*, 120, 65–73. <https://doi.org/10.1016/S0304-3800(99)00092-7>
+* Intrator, O., & Intrator, N. (2001). Interpreting neural-network results: a simulation study. *Computational Statistics & Data Analysis*, 37, 373–393. <https://doi.org/10.1016/S0167-9473(01)00016-0>
+* Valavi, R., Guillera-Arroita, G., Lahoz-Monfort, J. J., & Elith, J. (2022). Predictive performance of presence-only species distribution models: a benchmark study with reproducible code. *Ecological Monographs*, 92(1), e01486. <https://doi.org/10.1002/ecm.1486>

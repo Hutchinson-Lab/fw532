@@ -1,0 +1,159 @@
+project:
+  type: website
+  output-dir: _site
+  render:
+    - index.qmd
+    - schedule.qmd
+    - setup.qmd
+    - readings.qmd
+    - labs/*.qmd
+    - r/*.qmd
+    - python/*.qmd
+  # Before each render: write the student notebooks (python/*.ipynb) from python/*.qmd,
+  # then build the downloadable starter kits (downloads/*.zip)
+  pre-render:
+    - tools/build_notebooks.py
+    - tools/make_starter_kits.py
+  resources:
+    - downloads/*.zip
+
+website:
+  title: "FW 532"
+  description: "Machine Learning in Species Distribution Modeling — Oregon State University"
+  site-url: https://hutchinson-lab.github.io/fw532/
+  repo-url: https://github.com/Hutchinson-Lab/fw532
+  repo-actions: [source, issue]
+  favicon: assets/favicon.svg
+  page-navigation: true
+  back-to-top-navigation: true
+  bread-crumbs: false
+  search:
+    location: navbar
+    type: overlay
+  navbar:
+    background: light
+    logo: assets/favicon.svg
+    title: "FW 532"
+    left:
+      - text: Home
+        href: index.qmd
+      - text: Get set up
+        href: setup.qmd
+      - text: Labs
+        href: labs/index.qmd
+      - text: Schedule
+        href: schedule.qmd
+      - text: Readings
+        href: readings.qmd
+    right:
+      - icon: github
+        href: https://github.com/Hutchinson-Lab/fw532
+        aria-label: GitHub repository
+  sidebar:
+    - id: labs
+      title: "Labs"
+      style: docked
+      collapse-level: 1
+      contents:
+        - text: "All labs"
+          href: labs/index.qmd
+        - section: "Lab 1 · Simulation"
+          href: labs/01-simulation.qmd
+          contents:
+            - text: "R version"
+              href: r/lab01-simulation.qmd
+            - text: "Python version"
+              href: python/lab01-simulation.qmd
+        - section: "Lab 2 · Evaluation"
+          href: labs/02-evaluation.qmd
+          contents:
+            - text: "R version"
+              href: r/lab02-evaluation.qmd
+            - text: "Python version"
+              href: python/lab02-evaluation.qmd
+        - section: "Lab 3 · CART"
+          href: labs/03-cart.qmd
+          contents:
+            - text: "R version"
+              href: r/lab03-cart.qmd
+            - text: "Python version"
+              href: python/lab03-cart.qmd
+        - section: "Lab 4 · Random forests"
+          href: labs/04-random-forests.qmd
+          contents:
+            - text: "R version"
+              href: r/lab04-random-forests.qmd
+            - text: "Python version"
+              href: python/lab04-random-forests.qmd
+        - section: "Lab 5 · Boosted trees"
+          href: labs/05-brt.qmd
+          contents:
+            - text: "R version"
+              href: r/lab05-brt.qmd
+            - text: "Python version"
+              href: python/lab05-brt.qmd
+        - section: "Lab 6 · Maxent"
+          href: labs/06-maxent.qmd
+          contents:
+            - text: "R version"
+              href: r/lab06-maxent.qmd
+            - text: "Python version"
+              href: python/lab06-maxent.qmd
+        - section: "Bonus · Neural networks"
+          href: labs/07-neural-networks.qmd
+          contents:
+            - text: "R version"
+              href: r/lab07-neural-networks.qmd
+            - text: "Python version"
+              href: python/lab07-neural-networks.qmd
+        - section: "Demos"
+          href: labs/demos.qmd
+          contents:
+            - text: "Model bake-off & PDPs (R)"
+              href: r/demo-model-comparison.qmd
+            - text: "Model bake-off & PDPs (Python)"
+              href: python/demo-model-comparison.qmd
+            - text: "Marginal vs. partial effects (R)"
+              href: r/demo-effect-plots.qmd
+            - text: "Marginal vs. partial effects (Python)"
+              href: python/demo-effect-plots.qmd
+            - text: "Information leakage (R)"
+              href: r/demo-info-leakage.qmd
+            - text: "Information leakage (Python)"
+              href: python/demo-info-leakage.qmd
+            - text: "Point processes (R)"
+              href: r/demo-point-processes.qmd
+            - text: "Point processes (Python)"
+              href: python/demo-point-processes.qmd
+  page-footer:
+    left: "FW 532 · Machine Learning in Species Distribution Modeling · Oregon State University"
+    right:
+      - text: "Built with Quarto"
+        href: https://quarto.org
+
+format:
+  html:
+    theme:
+      light: [cosmo, assets/theme.scss]
+      dark: [darkly, assets/theme-dark.scss]
+    respect-user-color-scheme: true
+    css: assets/styles.css
+    include-after-body: assets/notebook-links.html
+    toc: true
+    toc-depth: 3
+    code-copy: true
+    code-overflow: scroll
+    fig-align: center
+    link-external-newwindow: true
+    smooth-scroll: true
+    highlight-style: a11y
+
+execute:
+  freeze: auto   # re-run code only when a file's source changes; results live in _freeze/
+
+knitr:
+  opts_chunk:
+    fig.width: 8
+    fig.height: 5
+    dpi: 110
+    comment: "#>"

@@ -1,0 +1,288 @@
+---
+title: "Demo: Marginal vs. Partial Effects"
+subtitle: "FW 532 · R version"
+---
+
+**Goals:**
+
+* To see the difference between *marginal* and *partial* effect plots, and compare both to the true effect of a variable in a simulated species.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`)
+* The helper functions in `r/effect_plot.R` (included in the starter kit)
+* R packages: terra, here, gbm, dismo, randomForest, ggplot2, plotly
+
+```{r}
+#| message: false
+library(terra)
+library(here)
+library(gbm)
+library(dismo)          # for gbm.fixed()
+library(randomForest)
+library(ggplot2)
+library(plotly)
+
+source(here("r", "effect_plot.R"))   # effect_plot() and plot_effect_2D()
+
+envStack <- rast(here("data", "envStack.tif"))
+
+# scale variables
+envStack <- scale(envStack)
+predVars <- names(envStack)
+```
+
+# Two ways to show the effect of one variable
+
+Most of our models have many predictors, but we usually want to look at the effect of one (or two) at a time. There are two common ways to collapse a model down to one variable, $x_j$. Write $\hat f(x_j, \mathbf{x}_{-j})$ for the model's prediction, where $\mathbf{x}_{-j}$ are all of the *other* variables.
+
+* A **marginal effect** sets all of the other variables to their means and varies only $x_j$:
+  $\quad \hat f\big(x_j = v,\ \mathbf{x}_{-j} = \bar{\mathbf{x}}_{-j}\big)$.
+  It is one slice through the model, at an "average" site.
+* A **partial effect** (the curve in a *partial dependence plot*, PDP) sets $x_j = v$ for *every* data point, leaves the other variables at their observed values, and averages the predictions:
+  $\quad \frac{1}{n}\sum_{i=1}^{n} \hat f\big(x_j = v,\ \mathbf{x}_{-j} = \mathbf{x}_{i,-j}\big)$.
+
+For a model that is linear on the scale of its predictions, these are the same. They differ when the model is nonlinear (including the logistic link that turns a linear predictor into a probability) and when $x_j$ interacts with other variables. Correlated predictors make the choice matter more: a partial effect averages over combinations of values that may never occur together in the real world, and a marginal effect describes a single "average" site that may not exist.
+
+In a simulation we also know the **true** effect, because we wrote down the probability of occurrence ourselves. So we can compute the true marginal and partial effects and check which features of each model's curves are real.
+
+# Simulate data
+
+```{r}
+# define logistic function
+logistic = function(x) {exp(x)/(1+exp(x))}
+
+# get points
+nPoints = 1000
+set.seed(1234)
+simPts = spatSample(envStack, size = nPoints, method = "random",
+                    na.rm = TRUE, xy = TRUE) # cells with data for all 20 variables (basically North America, not oceans)
+```
+
+This time the species responds to three variables, with a quadratic term and an interaction. `pOccFn()` gives the true probability of occurrence for (scaled) values of Mean.Diurnal.Range (`x1`), Isothermality (`x2`), and Mean.Temperature.of.Wettest.Quarter (`x3`).
+
+```{r}
+# set parameters
+intercept = -0.25
+beta1 = -1
+beta2 = 1
+beta3 = 1.5
+beta4 = 1
+beta5 = -1
+pOccFn = function(x1,x2,x3) {
+  logistic(intercept +
+             beta1 * x1 +
+             beta2 * x2 +
+             beta3 * x3 +
+             beta4 * x1^2 + # quadratic term
+             beta5 * x2 * x3) # interaction term
+}
+
+pOccRaster = pOccFn(envStack$Mean.Diurnal.Range,
+                    envStack$Isothermality,
+                    envStack$Mean.Temperature.of.Wettest.Quarter)
+names(pOccRaster) = "pOcc"
+
+# get the values that correspond to the points we selected:
+pOccs = extract(pOccRaster, simPts[, c("x", "y")], ID = FALSE)$pOcc
+
+# sample from these probabilities (a new seed for a new random step; see Lab 1):
+set.seed(5678)
+presAbs = rbinom(n=nPoints,size=1,prob=pOccs)
+
+presAbsFactor = factor(presAbs)   # for randomForest classification
+
+modelingDF = cbind(presAbs,presAbsFactor,simPts)
+
+# plot the result
+plot(pOccRaster)
+points(simPts$x[presAbs==0], simPts$y[presAbs==0], col="blue", pch=20)
+points(simPts$x[presAbs==1], simPts$y[presAbs==1], col="red", pch=20)
+legend("left",c("detection","non-detection"),col=c("red","blue"),pch=c(20,20),inset=0.02)
+
+# split into training and test
+trainData = modelingDF[1:(nPoints/2),]
+testData = modelingDF[(nPoints/2 + 1):nPoints,]
+```
+
+(We applied `pOccFn()` directly to the layers of `envStack`, which are already scaled, so the values in `trainData` are on the same scale that `pOccFn()` expects.)
+
+# The true effect of Mean.Diurnal.Range
+
+Let's start with the truth. We'll look at the effect of Mean.Diurnal.Range at each value observed in the training data.
+
+```{r}
+# range of covariate
+mdrRange <- range(trainData$Mean.Diurnal.Range)
+
+granularity = 555
+# create sequence along range of Mean.Diurnal.Range
+mdrGrid <- seq(mdrRange[1], mdrRange[2], length.out=granularity)
+
+# could also use only observed values
+mdrGrid <- sort(unique(trainData$Mean.Diurnal.Range))
+granularity <- length(mdrGrid)
+
+# true MARGINAL effect: the other two variables at their means
+margEstsTrue = pOccFn(mdrGrid,
+                      mean(trainData$Isothermality),
+                      mean(trainData$Mean.Temperature.of.Wettest.Quarter))
+
+# true PARTIAL effect: for each value, average over the observed values of the other two
+partialEstsTrue = numeric(granularity)
+for (i in 1:granularity) {
+  partialEstsTrue[i] = mean(pOccFn(mdrGrid[i],
+                                   trainData$Isothermality,
+                                   trainData$Mean.Temperature.of.Wettest.Quarter))
+}
+
+plot(mdrGrid, margEstsTrue, type="l", col="red", ylim=c(0,1),
+     xlab="Mean.Diurnal.Range (scaled)", ylab="p(spp)")
+lines(mdrGrid, partialEstsTrue, col="cyan3")
+legend("top", c("true marginal", "true partial"), col=c("red", "cyan3"), lty=1)
+
+# keep both in one data frame, to add to the model plots below
+trueEffects = data.frame(var = c(mdrGrid, mdrGrid),
+                         pred = c(margEstsTrue, partialEstsTrue),
+                         type = rep(c("marginal", "partial"), each = granularity))
+```
+
+Even for the true model, the two curves differ: here the partial curve is a little lower, and its dip is wider. The truth has no interaction involving Mean.Diurnal.Range, but the logistic link is nonlinear, so averaging probabilities over many sites (partial) is not the same as computing the probability at one average site (marginal).
+
+# Fit three models
+
+A boosted regression tree with only the 3 relevant variables, a random forest with 7 variables (the 3 relevant ones plus 4 others), and a misspecified GLM with the 3 relevant variables but no quadratic or interaction terms.
+
+```{r}
+set.seed(2468)   # gbm uses a random half of the data for each tree
+modelBRT <- gbm.fixed(data=trainData,
+                      gbm.x=c("Isothermality", "Mean.Diurnal.Range",
+                              "Mean.Temperature.of.Wettest.Quarter"), # only the 3 relevant
+                      gbm.y="presAbs",
+                      learning.rate=0.001,
+                      tree.complexity=2,
+                      n.trees=5000,
+                      verbose=FALSE)
+
+set.seed(1357)
+modelRF = randomForest(presAbsFactor~Annual.Mean.Temperature+
+                         Mean.Diurnal.Range+
+                         Mean.Temperature.of.Wettest.Quarter+
+                         Annual.Precipitation+
+                         Precipitation.Seasonality+
+                         elevation+
+                         Isothermality,
+                      data=trainData)
+
+modelGLMmisspec = glm(formula = presAbs~Mean.Diurnal.Range+Isothermality+Mean.Temperature.of.Wettest.Quarter,
+                      data=trainData,
+                      family = "binomial")
+```
+
+# Marginal vs. partial effects for each model
+
+`effect_plot()` (in `r/effect_plot.R`) computes the marginal and partial effects of a variable for any of these models, using the recipes above. Each call below draws both curves (solid), adds the true curves from the simulation (dashed, same colors), and shows the observed values of the variable as a rug along the bottom. The partial effects take a little while (up to about half a minute per model), because the model has to predict at all 500 training points for each of the ~500 values of Mean.Diurnal.Range.
+
+```{r}
+# 1D marginal and partial effects
+margBRT <- effect_plot(
+  model = modelBRT,
+  data = trainData,
+  vars = "Mean.Diurnal.Range",
+  effect_type = "both",
+  type = "response",
+  truth = trueEffects,
+  title = "BRT (gbm.fixed, 3 variables)",
+  n.trees = modelBRT$gbm.call$best.trees
+)
+```
+
+```{r}
+# 1D marginal and partial effects
+margRF <- effect_plot(
+  model = modelRF,
+  data = trainData,
+  vars = "Mean.Diurnal.Range",
+  effect_type = "both",
+  type = "prob",
+  truth = trueEffects,
+  title = "Random forest (7 variables)"
+)
+```
+
+```{r}
+# 1D marginal and partial effects
+margGLM <- effect_plot(
+  model = modelGLMmisspec,
+  data = trainData,
+  vars = "Mean.Diurnal.Range",
+  effect_type = "both",
+  type = "response",
+  truth = trueEffects,
+  title = "Misspecified GLM (no quadratic or interaction terms)"
+)
+```
+
+::: {.callout-tip title="Question"}
+For each model, which features of the marginal and partial curves match the truth, and which don't? Which differences come from the model (e.g., the GLM can't represent a quadratic), and which come from the difference between a marginal and a partial effect?
+:::
+
+::: {.callout-tip title="Question"}
+Try `vars = "Isothermality"`, which interacts with Mean.Temperature.of.Wettest.Quarter in the true model. (You'll need to compute its true effects the same way we did for Mean.Diurnal.Range.) How do the marginal and partial curves compare now?
+:::
+
+# A two-variable partial effect
+
+With two variables we get a surface. Here is the partial effect of the two interacting variables, Isothermality and Mean.Temperature.of.Wettest.Quarter, from the BRT model. We use an evenly spaced 25 × 25 grid over the range of each variable (`grid = "range"`), since every grid point needs predictions at all 500 training points. The black points on the floor of the plot are the training data, so you can see where the surface is supported by data and where it is extrapolating. Drag to rotate.
+
+```{r}
+# Compute 2D partial dependence
+df2 <- effect_plot(
+  model = modelBRT,
+  data = trainData,
+  vars = c("Isothermality","Mean.Temperature.of.Wettest.Quarter"),
+  effect_type = "partial",
+  grid = "range",
+  granularity = 25,
+  type = "response",
+  plot = FALSE,                # don't auto-plot
+  n.trees = modelBRT$gbm.call$best.trees
+)
+
+# Plot with wrapper
+p2 <- plot_effect_2D(
+  df = df2,
+  varnames = c("var1","var2"),
+  predname = "pred",
+  data_points = trainData[, c("Isothermality","Mean.Temperature.of.Wettest.Quarter")],  # empirical points
+  axis_titles = c("Isothermality","Mean.Temperature.of.Wettest.Quarter"),
+  colorscale = "Earth",
+  rug = TRUE,
+  zlim = c(0, 1)
+)
+
+p2  # interactive plotly
+```
+
+For comparison, here is the true partial effect of the same two variables, computed from `pOccFn()` by averaging over the observed values of Mean.Diurnal.Range:
+
+```{r}
+trueDF2 <- df2[, c("var1", "var2")]
+trueDF2$pred <- NA
+for (i in 1:nrow(trueDF2)) {
+  trueDF2$pred[i] <- mean(pOccFn(trainData$Mean.Diurnal.Range,
+                                 trueDF2$var1[i], trueDF2$var2[i]))
+}
+
+plot_effect_2D(
+  df = trueDF2,
+  data_points = trainData[, c("Isothermality","Mean.Temperature.of.Wettest.Quarter")],
+  axis_titles = c("Isothermality","Mean.Temperature.of.Wettest.Quarter"),
+  colorscale = "Earth",
+  zlim = c(0, 1)
+)
+```
+
+::: {.callout-tip title="Question"}
+Where does the BRT surface match the true surface, and where doesn't it? Compare the disagreements with where the training points are.
+:::

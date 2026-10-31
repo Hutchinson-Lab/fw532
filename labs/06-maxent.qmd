@@ -1,0 +1,143 @@
+---
+title: "Lab 6: Maxent"
+subtitle: "Model presence-only data with the most widely used SDM software, then open the black box in code"
+description: "Write simulated presence-only data and climate grids for the Maxent Java app, work through the Maxent tutorial with a species whose truth you know, and fit the same model in R (maxnet) and Python (elapid)."
+image: images/lab06.png
+order: 6
+---
+
+::: {.lab-meta}
+[Week 7]{} [Reading: Elith et al. (2011)]{} [Methods: Maxent (Java app, maxnet, elapid)]{} [R · Python]{}
+:::
+
+## Why this lab?
+
+Most species occurrence records are *presence-only*: museum and herbarium specimens, citizen-science sightings, and atlas records tell you where a species was seen, but not where someone looked and failed to find it. Maxent is the most widely used method for this kind of data, largely because its free Java application is easy to run and gives a full report of maps, response curves, and evaluation statistics with a few clicks.
+
+Easy to run doesn't mean easy to interpret. What does a Maxent map actually estimate? Why does it need "background" points, and what are they? Why can't it tell you how common the species is? These questions have clear answers once you see Maxent as a statistical model (Elith et al. 2011), and the answers change how you should read its output.
+
+In this lab you give Maxent a virtual species whose true distribution you know, the same one you built in Lab 1. That lets you check what Maxent gets right and wrong, and how its settings (variables, feature classes, regularization) change the answer. You then fit the same model in R or Python, where it can sit alongside the other methods in the course.
+
+## Key concepts
+
+### Presence-only data and background points
+
+With presence–absence data, a model contrasts places where the species was found with places where it wasn't. With presence-only data there are no absences to contrast with, so Maxent compares the environments at the presence records with the environments **available** in the study region. The available environments are described by a **background** sample: a large random sample of locations (grid cells) from the region.
+
+::: {.concept}
+**Background points are not absences.** They are a sample of what the landscape offers, and some of them will fall where the species occurs. Their job is to describe the environment across the whole region, so that the model can ask which conditions are *over-represented* at the presence sites relative to what's available.
+:::
+
+Elith et al. (2011) frame this in environmental (covariate) space. Let $z$ be the vector of environmental values. Then $f_1(z)$ is the density of $z$ at locations where the species is present, and $f(z)$ is its density across the whole landscape (estimated from the background). Bayes' rule links these to the probability of presence:
+
+$$
+\Pr(y = 1 \mid z) = \frac{f_1(z)}{f(z)}\,\Pr(y = 1).
+$$
+
+Presence records estimate $f_1$, and background points estimate $f$. The last term, the species' **prevalence** $\Pr(y = 1)$ (the proportion of sites occupied), can't be estimated from presence-only data however many records you have. Formally, it is not *identifiable* (Elith et al. 2011). So Maxent estimates the ratio $f_1(z)/f(z)$, a *relative* suitability, and anything on an absolute probability scale depends on an extra assumption.
+
+### What Maxent fits
+
+Maxent chooses the $f_1$ that is closest to $f$ (minimum relative entropy, the "maximum entropy" in the name) subject to constraints: the average of each **feature** under $f_1$ must be close to its average at the presence records. The solution is an exponential (log-linear) model,
+
+$$
+f_1(z) = f(z)\, e^{\eta(z)}, \qquad \eta(z) = \alpha + \beta_1 h_1(z) + \beta_2 h_2(z) + \dots,
+$$
+
+where the $h_j(z)$ are features built from the environmental variables and $\alpha$ is a normalizing constant (Elith et al. 2011). In words: the model reweights the available environments, up-weighting the conditions where the species was recorded.
+
+### Maxent is a point process model
+
+The same model can be reached from a different direction. Treat the presence records as points scattered over the region by an **inhomogeneous Poisson process** with intensity $\lambda(s)$, the expected number of records per unit area at location $s$, modeled as $\log \lambda(s) = \beta_0 + \beta_1 h_1(z(s)) + \dots$. Renner & Warton (2013) showed that Maxent is equivalent to this Poisson point process model, differing only in the intercept term, which is scale-dependent in Maxent. Fithian & Hastie (2013) showed it is also equivalent to a logistic regression of presences against background points in which the background points get an "infinite" weight. This is how the R package **maxnet** fits Maxent (weight 100 on each background point, fitted with glmnet; Phillips et al. 2017), and the Python package **elapid** follows the same approach.
+
+The point process view explains what background points are for. Fitting the model requires the integral of $\lambda(s)$ over the whole region (the expected total number of records), and the background points are a sample used to approximate that integral (Renner et al. 2015). More background points give a better approximation; they don't need to look like absences at all. The [point-process demo](../r/demo-point-processes.qmd) simulates exactly this process.
+
+### Features and regularization
+
+Maxent builds flexible response curves from simple transformations of each variable, called **feature classes**:
+
+| Feature class | Form | Gives the model… |
+|---|---|---|
+| Linear | $x$ | a steady increase or decrease |
+| Quadratic | $x^2$ | a hump or a bowl (an optimum) |
+| Product | $x_i x_j$ | interactions between pairs of variables |
+| Hinge | $\max(0, x - k)$ for knots $k$ | piecewise-linear curves, like a GAM |
+| Threshold | $1$ if $x > k$, else $0$ | step functions |
+| Categorical | one indicator per class | effects of a categorical variable |
+
+By default, the classes used depend on the number of presence records: linear always; quadratic with at least 10 records; hinge with at least 15; product with at least 80. Threshold features have been off by default since Maxent 3.4 (Phillips et al. 2017). maxnet uses the same rule.
+
+With 20 variables and hundreds of features, an unconstrained model would overfit badly. Maxent therefore uses **regularization**: it penalizes the sum of the absolute values of the coefficients (an L1 or lasso penalty), which shrinks most coefficients to exactly zero. Each feature gets its own penalty, scaled by how variable it is at the presence sites and by a constant tuned for each feature class (Elith et al. 2011). One overall knob, the **regularization multiplier** (`regmult` in maxnet, `beta_multiplier` in elapid, "Regularization multiplier" in the Java app), scales all of them: larger values give smoother, simpler response curves, smaller values let the model follow the training data more closely.
+
+### Output formats
+
+The fitted model can be reported on several scales. All of them rank locations in the same order; they differ in what the numbers are meant to represent.
+
+| Output | What it is | Interpretation |
+|---|---|---|
+| **Raw** | $e^{\eta(z)}$, scaled to sum to 1 over the background | relative intensity, proportional to expected abundance if sampling is unbiased (Phillips et al. 2017) |
+| **Logistic** (default before 3.4) | a logistic transform of raw output | probability of presence, *assuming* it is 0.5 at sites with typical conditions for the species (Elith et al. 2011) |
+| **Cloglog** (default since 3.4) | $1 - e^{-e^{H + \eta(z)}}$, where $H$ is the model's entropy | probability of presence (at least one individual) in a small area around each location, from the point process view; the offset $H$ is an assumption that gives about 0.63 at locations with typical conditions (Phillips et al. 2017) |
+
+Both probability scales depend on an assumed constant because prevalence isn't identifiable. Compare their *patterns* across the map with the truth, but be cautious about reading their values as probabilities. Yackulic et al. (2013) found that many published Maxent studies overlooked this and the assumptions below.
+
+### Sampling bias and target-group background
+
+Presence records reflect where the species lives *and* where people looked: near roads, cities, field stations, and favorite sites. If presences are biased but the background is a uniform sample of the region, Maxent models the sampling effort along with the species. Phillips et al. (2009) show that if the background has the *same* bias as the presences, the bias cancels out of the ratio $f_1(z)/f(z)$. Two practical ways to do this are:
+
+* **Target-group background:** use records of other species collected by similar methods (e.g., all herbarium records for a plant family) as the background, since they share the sampling bias.
+* **Bias file:** give Maxent a map of relative sampling effort, and it draws the background in proportion to it.
+
+The lab ends with a note on supplying your own background points this way.
+
+## What you'll do
+
+1. Write the 20 environmental layers as ASCII grids (`.asc`), the format the Maxent app reads.
+2. Simulate presence-only data for the Lab 1 virtual species, and write the presences, plus an independent test set, to CSV files.
+3. Work through the Maxent tutorial with your data in the Java app: doing a run, test data, output formats, statistical analysis, variable importance, response curves, and feature types.
+4. **Exercise:** rerun Maxent with only the true variables, with one irrelevant variable added, or with linear features only, and compare what it recovers.
+5. Fit the same model in code (maxnet in R, elapid in Python): response curves, ROC on the training data, and a predicted map next to the truth.
+
+## Get the starter code
+
+Both versions do the same analysis step by step. Pick the language you're learning (or try both!). The Maxent Java part is identical for everyone: download Maxent 3.4.4 and the tutorial from the [Maxent website](https://biodiversityinformatics.amnh.org/open_source/maxent/). New to the course? Start with [Get set up](../setup.qmd).
+
+::: {.starter-code}
+::: {.track}
+#### R
+
+[Read the R lab](../r/lab06-maxent.qmd){.btn .btn-primary}
+[R starter kit (.zip)](../downloads/fw532-R-labs.zip){.btn .btn-outline-primary}
+
+In the kit, open `fw532.Rproj`, then `r/lab06-maxent.qmd`. Uses **terra**, **maxnet**, and **pROC**.
+:::
+
+::: {.track .python}
+#### Python
+
+[Read the Python lab](../python/lab06-maxent.qmd){.btn .btn-primary}
+[Open in Colab](https://colab.research.google.com/github/Hutchinson-Lab/fw532/blob/main/python/lab06-maxent.ipynb){.btn .btn-outline-primary}
+[Python starter kit (.zip)](../downloads/fw532-python-labs.zip){.btn .btn-outline-primary}
+
+Open `python/lab06-maxent.ipynb`. Uses **numpy**, **pandas**, **matplotlib**, **scikit-learn**, and **elapid**.
+:::
+:::
+
+## Turn in
+
+Post to the Canvas discussion for this lab by the due date on Canvas. Include brief descriptions of your exploration of the exercises, with any relevant plots. If applicable, also include:
+
+* key take-aways you'd want to remember for a future SDM project, and
+* remaining questions or confusions you'd like to learn more about.
+
+## Readings & resources
+
+* Elith, J., Phillips, S. J., Hastie, T., Dudík, M., Chee, Y. E., & Yates, C. J. (2011). A statistical explanation of MaxEnt for ecologists. *Diversity and Distributions*, 17(1), 43–57. <https://doi.org/10.1111/j.1472-4642.2010.00725.x>
+* Phillips, S. J., Anderson, R. P., Dudík, M., Schapire, R. E., & Blair, M. E. (2017). Opening the black box: an open-source release of Maxent. *Ecography*, 40(7), 887–893. <https://doi.org/10.1111/ecog.03049>
+* Phillips, S. J., Dudík, M., Elith, J., Graham, C. H., Lehmann, A., Leathwick, J., & Ferrier, S. (2009). Sample selection bias and presence-only distribution models: implications for background and pseudo-absence data. *Ecological Applications*, 19(1), 181–197. <https://doi.org/10.1890/07-2153.1>
+* Yackulic, C. B., Chandler, R., Zipkin, E. F., Royle, J. A., Nichols, J. D., Campbell Grant, E. H., & Veran, S. (2013). Presence-only modelling using MAXENT: when can we trust the inferences? *Methods in Ecology and Evolution*, 4(3), 236–243. <https://doi.org/10.1111/2041-210x.12004>
+* Renner, I. W., Elith, J., Baddeley, A., Fithian, W., Hastie, T., Phillips, S. J., Popovic, G., & Warton, D. I. (2015). Point process models for presence-only analysis. *Methods in Ecology and Evolution*, 6(4), 366–379. <https://doi.org/10.1111/2041-210X.12352>
+* Renner, I. W., & Warton, D. I. (2013). Equivalence of MAXENT and Poisson point process models for species distribution modeling in ecology. *Biometrics*, 69(1), 274–281. <https://doi.org/10.1111/j.1541-0420.2012.01824.x>
+* Fithian, W., & Hastie, T. (2013). Finite-sample equivalence in statistical models for presence-only data. *The Annals of Applied Statistics*, 7(4). <https://doi.org/10.1214/13-AOAS667>
+* Maxent software (version 3.4.4) and tutorial: <https://biodiversityinformatics.amnh.org/open_source/maxent/>
+* elapid documentation: <https://earth-chris.github.io/elapid/>

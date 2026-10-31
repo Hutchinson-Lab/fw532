@@ -1,0 +1,41 @@
+---
+title: "Labs"
+subtitle: "Hands-on exercises, each in R and in Python"
+toc: false
+listing:
+  id: lab-list
+  contents: "0*.qmd"
+  type: grid
+  sort: "order"
+  fields: [image, title, description]
+  grid-columns: 3
+  image-height: 170px
+  image-placeholder: ../assets/favicon.svg
+---
+
+Each lab has an **overview page** (why it matters, key concepts, what you'll do) and two parallel versions of the code: an **R notebook** (`.qmd`) and a **Python notebook** (`.ipynb`). They follow the same steps, so you can work in either language, or compare the two side by side.
+
+::: {.callout-tip title="First time here?"}
+Follow [Get set up](../setup.qmd) to download a starter kit with every lab and the course data. Python notebooks can also run on Google Colab with nothing to install.
+:::
+
+:::{#lab-list}
+:::
+
+## Demos
+
+Shorter, instructor-led examples used in class: a model bake-off with partial dependence plots, marginal vs. partial effects, information leakage in evaluation, and sampling from a point process. See the [demos page](demos.qmd).
+
+## Packages by lab
+
+| Lab | R | Python |
+|---|---|---|
+| 1 · Simulation | terra, ggplot2, ggcorrplot | numpy, pandas, matplotlib, statsmodels |
+| 2 · Evaluation | caret, pROC, PRROC, blockCV | scikit-learn, statsmodels |
+| 3 · CART | rpart, rpart.plot, pROC | scikit-learn |
+| 4 · Random forests | randomForest, ranger, caret, pROC | scikit-learn |
+| 5 · Boosted trees | gbm, dismo, pROC | scikit-learn |
+| 6 · Maxent | maxnet (+ Maxent Java app) | elapid (+ Maxent Java app) |
+| 7 · Neural networks (bonus) | neuralnet, pROC | scikit-learn |
+
+Every R lab also uses **terra** and **here**. Every Python lab also uses **numpy**, **pandas**, **matplotlib**, and the course helper **sdmlab**.

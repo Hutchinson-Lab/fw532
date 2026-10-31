@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#D73F09"/>
+  <!-- a stylised leaf over map contours -->
+  <path d="M14 44c8-3 14-3 22 0s14 3 18 1" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" opacity=".55"/>
+  <path d="M14 52c8-3 14-3 22 0s14 3 18 1" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" opacity=".35"/>
+  <path d="M20 38C20 22 32 12 48 11c0 17-10 28-25 28" fill="#fff"/>
+  <path d="M22 37 40 20" stroke="#D73F09" stroke-width="2.5" stroke-linecap="round"/>
+</svg>

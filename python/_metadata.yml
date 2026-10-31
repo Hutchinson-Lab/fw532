@@ -1,0 +1,4 @@
+# Quarto settings for the Python labs in this folder.
+# The labs are written as .qmd files (edit those). Quarto runs them with Jupyter when it builds the
+# website; tools/build_notebooks.py writes the matching clean .ipynb notebooks for students.
+jupyter: python3

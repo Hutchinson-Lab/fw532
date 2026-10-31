@@ -1,0 +1,252 @@
+---
+title: "Lab 1: Simulation & Types of Data"
+subtitle: "FW 532 · Python version"
+---
+
+**Goals:**
+
+* To get comfortable simulating data in Python.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* Python packages: numpy, pandas, matplotlib, statsmodels, rasterio (see `requirements.txt`)
+* The course helper module `sdmlab.py` (in the same folder as this notebook)
+
+> **New to Python notebooks?** A notebook is a list of *cells*. Click a code cell and press
+> **Shift + Enter** to run it. Run the cells in order from top to bottom: later cells use
+> variables created by earlier ones.
+
+```{python}
+# Running on Google Colab? This cell downloads the course files. (Anywhere else it does nothing.)
+import os, sys
+if "google.colab" in sys.modules:
+    if not os.path.exists("/content/fw532"):
+        !git clone -q --depth 1 https://github.com/Hutchinson-Lab/fw532.git /content/fw532
+        %pip install -q rasterio
+    os.chdir("/content/fw532/python")
+```
+
+First, load the packages we need. `sdmlab` is a small helper module written for this course.
+It does the raster (map) operations that the `terra` package does in the R version of the labs.
+Open `sdmlab.py` if you're curious -- it is ordinary numpy and matplotlib code.
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+
+import sdmlab as sdm   # course helpers for rasters
+```
+
+Here are a few environmental variables for us to start with. These are climatic variables from
+WorldClim (averages for 1970-2000; <https://www.worldclim.org/data/bioclim.html>) and elevation,
+covering roughly North America. The spatial resolution is 10 minutes, which is about 13km at 45
+degrees latitude. More generally, you could start with any set of variables at any extent that you
+wish.
+
+A raster is a grid of cells. In Python we store it as a 2-D array (rows × columns); a *stack* of
+20 rasters is a 3-D array (layers × rows × columns). Ocean cells have no data, which numpy writes as
+`nan` ("not a number").
+
+```{python}
+env_stack = sdm.load_env()
+print(env_stack)
+print(env_stack.values.shape)   # (layers, rows, columns)
+```
+
+```{python}
+env_stack.plot();
+```
+
+# A data simulator
+
+Next, let's select some locations to simulate species data. Random numbers in Python come from a
+*random number generator*. If we create the generator with a fixed *seed* (any number), we all get
+the same "random" results, which makes the lab reproducible. You'll see a seed given every time we
+do something random.
+
+Let's scale the environmental variables, since we'll work with simple regression frameworks to start.
+
+```{python}
+# scale variables (each layer gets mean 0 and standard deviation 1)
+env_stack = env_stack.scale()
+
+n_points = 1000
+# pick random land cells; could change this from random to a procedure reflecting sampling bias
+sim_pts = env_stack.sample_random(n_points, seed=1234)
+sim_pts.iloc[:5, :5]
+```
+
+`sim_pts` is a pandas DataFrame (a table) with one row per sampled location: the coordinates
+(`x` = longitude, `y` = latitude) followed by the value of each environmental layer at that location.
+
+```{python}
+# plot the points over the first climate raster:
+ax = sdm.plot_map(env_stack["Annual.Mean.Temperature"], env_stack, title="Annual.Mean.Temperature")
+ax.scatter(sim_pts["x"], sim_pts["y"], s=4, color="black");
+```
+
+To simulate a species, we'll make up a function to define its probability of occurrence as a
+function of the environmental variables. Let's look at their correlation as we consider what
+variables to include.
+
+```{python}
+# check out their correlation (Spearman's rank correlation):
+correl = sim_pts[env_stack.names].corr(method="spearman")
+
+fig, ax = plt.subplots(figsize=(9, 8))
+im = ax.imshow(correl, cmap="RdBu_r", vmin=-1, vmax=1)
+ax.set_xticks(range(len(correl)), correl.columns, rotation=90, fontsize=8)
+ax.set_yticks(range(len(correl)), correl.index, fontsize=8)
+fig.colorbar(im, ax=ax, label="Spearman correlation");
+```
+
+Somewhat arbitrarily, let's use variables 6, 15, and 8 (Min.Temperature.of.Coldest.Month,
+Precipitation.Seasonality, and Mean.Temperature.of.Wettest.Quarter). The coefficients of the linear
+function are somewhat arbitrary as well ('hand-tuned'). Note that we're scaling the input variables
+as we compute this, so that every variable is on a comparable scale.
+
+Each `env_stack["..."]` below is a whole map (a 2-D array), so `p_occ` is computed for every cell at
+once.
+
+```{python}
+def logistic(x):
+    return 1 / (1 + np.exp(-x))
+
+# parameters
+intercept = -1.5
+beta1 = -1.5
+beta2 = -1.5
+beta3 = 1.5
+p_occ = logistic(intercept
+                 + beta1 * sdm.scale(env_stack["Precipitation.Seasonality"])
+                 + beta2 * sdm.scale(env_stack["Min.Temperature.of.Coldest.Month"])
+                 + beta3 * sdm.scale(env_stack["Mean.Temperature.of.Wettest.Quarter"]))
+
+# plot the three relevant climate variables and the probability of occurrence
+fig, axes = plt.subplots(2, 2, figsize=(11, 6.5), constrained_layout=True)
+for ax, name in zip(axes.flat, ["Precipitation.Seasonality", "Min.Temperature.of.Coldest.Month",
+                                "Mean.Temperature.of.Wettest.Quarter"]):
+    sdm.plot_map(env_stack[name], env_stack, ax=ax, title=name)
+sdm.plot_map(p_occ, env_stack, ax=axes[1, 1], title="Probability of Occurrence");
+```
+
+Next, we use `rng.binomial()` to "flip a coin" with probability of heads corresponding to the value
+of the `p_occ` surface at the sampling points. Points with a high p_occ (e.g., 0.9) will be more
+likely (but not certain) to be heads (present). Points with a low p_occ (e.g., 0.2) will be more
+likely (but not certain) to be tails (absent).
+
+```{python}
+# get the values that correspond to the points we selected:
+probs = sdm.extract(p_occ, env_stack, sim_pts["x"], sim_pts["y"])
+
+# sample from these probabilities (note the *different* seed -- see below):
+rng = np.random.default_rng(5678)
+obs = rng.binomial(n=1, p=probs)
+
+# put response and variables together in a DataFrame:
+modeling_df = sim_pts.copy()
+modeling_df.insert(0, "PresAbs", obs)
+
+fig, ax = plt.subplots(figsize=(7, 4))
+for value, color in [(0, "tab:red"), (1, "tab:cyan")]:
+    rows = modeling_df["PresAbs"] == value
+    ax.scatter(modeling_df.loc[rows, "x"], modeling_df.loc[rows, "y"], s=6, color=color, label=str(value))
+ax.set_aspect("equal")
+ax.legend(title="PresAbs");
+```
+
+> **Why a different seed?** Fixing seeds makes results reproducible, but **don't reuse the same
+> seed for different steps**: you would replay the same stream of random numbers. In R, reusing
+> `set.seed(1234)` here makes the presence/absence coin-flips depend on the random numbers that chose
+> the locations, which correlates "present" with latitude and biases the fitted coefficients. Using a
+> new seed for each random step avoids that trap.
+
+Now, supposing we had only been given these data, we could imagine fitting a model to them. Let's
+start with logistic regression, using the `statsmodels` package. A logistic regression is a
+*generalized linear model* (GLM) with a binomial family -- the same thing R's `glm(..., family =
+"binomial")` fits. `sm.add_constant()` adds the intercept column.
+
+```{python}
+vars1 = ["Precipitation.Seasonality",
+         "Min.Temperature.of.Coldest.Month",
+         "Mean.Temperature.of.Wettest.Quarter"]
+
+model1 = sm.GLM(modeling_df["PresAbs"],
+                sm.add_constant(modeling_df[vars1]),
+                family=sm.families.Binomial()).fit()
+print(model1.summary())
+```
+
+Notice that our parameter estimates are close to the true values we used to simulate the data, as
+you might expect.
+
+> **Question:** Under what conditions would you NOT expect the parameter estimates to be close to
+> the true values?
+
+Of course, we might not know the correct variables in advance!
+
+> **Question:** What happens if you omit one of the variables we used? What happens if you add some
+> variables that we didn't use?
+
+Here are some more concrete models for you to check out as you answer these questions (use
+`print(model2.summary())` and so on to inspect them):
+
+```{python}
+def fit_logistic(variables, data=modeling_df):
+    """Fit a logistic regression of PresAbs on the given variables."""
+    return sm.GLM(data["PresAbs"], sm.add_constant(data[variables]),
+                  family=sm.families.Binomial()).fit()
+
+vars2 = ["Precipitation.Seasonality",
+         "Mean.Temperature.of.Coldest.Quarter",
+         "Mean.Temperature.of.Wettest.Quarter"]
+vars3 = ["Precipitation.Seasonality",
+         "Temperature.Seasonality",
+         "Mean.Temperature.of.Wettest.Quarter"]
+vars4 = ["Precipitation.Seasonality",
+         "Min.Temperature.of.Coldest.Month",
+         "Mean.Temperature.of.Wettest.Quarter",
+         "Mean.Diurnal.Range"]
+
+model2 = fit_logistic(vars2)
+model3 = fit_logistic(vars3)
+model4 = fit_logistic(vars4)
+```
+
+In addition to looking at the estimated parameters, we can look at the predicted maps from these
+models. To predict a map, we make a table with one row per land cell (`to_frame()`), predict for
+every row, and put the predictions back onto the grid (`to_map()`).
+
+```{python}
+grid = env_stack.to_frame()   # one row per land cell
+pred1 = env_stack.to_map(model1.predict(sm.add_constant(grid[vars1])))
+pred2 = env_stack.to_map(model2.predict(sm.add_constant(grid[vars2])))
+pred3 = env_stack.to_map(model3.predict(sm.add_constant(grid[vars3])))
+pred4 = env_stack.to_map(model4.predict(sm.add_constant(grid[vars4])))
+
+fig, axes = plt.subplots(2, 3, figsize=(14, 6), constrained_layout=True)
+maps = [p_occ, pred1, pred2, pred3, pred4]
+titles = ["Truth", "Model1", "Model2", "Model3", "Model4"]
+for ax, m, title in zip(axes.flat, maps, titles):
+    sdm.plot_map(m, env_stack, ax=ax, title=title, vmin=0, vmax=1)
+axes[1, 2].set_visible(False)
+```
+
+> **Exercise:** Create your own simulated species by modifying the code above in some way. If you
+> need inspiration, perhaps consider a species you are interested in. You could change the important
+> variables, the parameter values, the sampling procedure, the type of data that is created (e.g.,
+> abundance instead of presence/absence; try `rng.poisson()`)... Have fun!
+
+# Turn in
+
+**(a Canvas discussion post, by the due date on Canvas)** Please post to the online discussion of
+this lab. Please include a brief description of your simulated species (what aspects of the process
+you explored), along with plots and any comments you have about the exercise. Please also include, if
+applicable:
+
+* Any key take-aways from this lab that you want to remember for any future projects you may conduct
+  in which you use species distribution models.
+* Any remaining questions or confusions do you have that you might like to learn more about.

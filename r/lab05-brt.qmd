@@ -1,0 +1,256 @@
+---
+title: "Lab 5: Boosted Regression Trees (BRT)"
+subtitle: "FW 532 · R version"
+---
+
+**Goals:**
+
+* To understand how boosted regression tree models are built and interpreted in R.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* R packages: terra, here, dismo, gbm, pROC (run `source("install_packages.R")` once to install everything for the term)
+* The dismo BRT tutorial: [Boosted regression trees for ecological modeling](https://rspatial.org/raster/sdm/9_sdm_brt.html) (Elith & Leathwick)
+
+::: {.callout-note collapse="true" title="Working in the course R project"}
+Open `fw532.Rproj` (in RStudio or Positron) before you start. The `here()` function builds file paths starting from the project folder, so the same code works on everyone's computer and you never need to set your working directory. For example, `here("data", "envStack.tif")` points to the data file no matter where you put the project.
+:::
+
+# Setup
+
+New R packages this week: dismo, gbm. In this lab, you will run the [dismo vignette/tutorial](https://rspatial.org/raster/sdm/9_sdm_brt.html) on BRTs on simulated data.
+
+The tutorial was written for the older `raster` package, but its model-fitting functions (`gbm.step()`, `gbm.plot()`, `gbm.interactions()`, and so on) work unchanged on our data. Only the mapping step is different: we use `terra::predict()` (shown below).
+
+```{r}
+#| message: false
+library(dismo)  # gbm.step() and the other BRT helper functions from the tutorial
+library(gbm)    # the boosting engine underneath dismo's BRT functions
+library(terra)  # rasters (gridded maps); loaded after dismo so terra's functions take priority
+library(here)   # file paths relative to the project folder
+library(pROC)
+
+envStack <- rast(here("data", "envStack.tif"))
+```
+
+# Simulate Data
+
+This is the same data simulation as last lab, with a nonlinear function of the environmental variables. Feel free to experiment as well with the original linear version (commented out here) or a function of your own choosing.
+
+One difference from last lab: here we sample points wherever the climate data exist and then extract *all* the layers at those points, even if some values are missing (`NA`). A few points near the coast have climate data but no elevation. We keep them on purpose, because BRTs can handle missing predictor values (Elith et al. 2008).
+
+```{r}
+# define logistic function
+logistic <- function(x) {exp(x)/(1+exp(x))}
+
+# get points
+nPoints <- 1000
+set.seed(1234)
+simPts0 <- spatSample(envStack$Isothermality, size = nPoints, method = "random",
+                      na.rm = TRUE, xy = TRUE) # sample points where climate data exists (basically in North America, not oceans)
+simPts <- cbind(simPts0[, c("x", "y")],
+                extract(envStack, simPts0[, c("x", "y")], ID = FALSE)) # sample all raster values for these points, even if they are NA
+sum(!complete.cases(simPts)) # how many points have at least one missing value?
+
+# set parameters
+#intercept = -1.5
+#beta1 = -2
+#beta2 = -1.5
+#beta3 = 1.5
+#pOccRaster = logistic(intercept +
+#                  beta1 * scale(envStack$Precipitation.Seasonality) +
+#                  beta2 * scale(envStack$Min.Temperature.of.Coldest.Month) +
+#                  beta3 * scale(envStack$Mean.Temperature.of.Wettest.Quarter))
+
+intercept <- -0.25
+beta1 <- -1
+beta2 <- 1
+beta3 <- 1.5
+beta4 <- 1
+beta5 <- -1
+pOccRaster <- logistic(intercept +
+                  beta1 * scale(envStack$Mean.Diurnal.Range) +
+                  beta2 * scale(envStack$Isothermality) +
+                  beta3 * scale(envStack$Mean.Temperature.of.Wettest.Quarter) +
+                  beta4 * scale(envStack$Mean.Diurnal.Range)^2 + # quadratic term
+                  beta5 * scale(envStack$Isothermality) * scale(envStack$Mean.Temperature.of.Wettest.Quarter)) # interaction term
+names(pOccRaster) <- "pOcc"
+
+# get the values that correspond to the points we selected:
+pOccs <- extract(pOccRaster, simPts[, c("x", "y")], ID = FALSE)$pOcc
+
+# sample from these probabilities (a *different* seed than above; see Lab 1):
+set.seed(5678)
+presAbs <- rbinom(n = nPoints, size = 1, prob = pOccs)
+
+# put response and variables together in a data.frame:
+modelingDF <- cbind(presAbs, simPts)
+
+# plot the result
+plot(pOccRaster)
+points(modelingDF$x[modelingDF$presAbs == 0], modelingDF$y[modelingDF$presAbs == 0],
+       col = "blue", pch = 20)
+points(modelingDF$x[modelingDF$presAbs == 1], modelingDF$y[modelingDF$presAbs == 1],
+       col = "red", pch = 20)
+legend("left", c("presence", "absence"), col = c("red", "blue"), pch = c(20, 20))
+
+# split into training and test
+trainData <- modelingDF[1:(nPoints/2), ]
+testData <- modelingDF[(nPoints/2 + 1):nPoints, ]
+```
+
+(`spatSample()` returns the points in random order, so taking the first half for training and the second half for testing is a random split. The coordinates of each point are in the `x` and `y` columns.)
+
+From here, dive into the tutorial. Make sure you consider THIS data as you go through. For instance, if the tutorial tunes a parameter with some rationale for their data, use the rationale and not their final value to set the parameter in your analysis.
+
+# Getting started: the tutorial's main steps on our data
+
+::: {.callout-note title="A starting point, not tuned answers"}
+This section runs the tutorial's main steps once on our simulated data, so you have working code to build on. It uses the tutorial's *first* settings (tree complexity 5, learning rate 0.01, bag fraction 0.5). These are **not** tuned for our data. As you read the tutorial, revisit each choice using its rationale, and refit.
+:::
+
+The tutorial's data have the response in column 2 and the predictors in columns 3-13. dismo's functions take column numbers, so we look ours up by name:
+
+```{r}
+predVars <- names(envStack)                    # all 20 layers are candidate predictors
+gbmX <- match(predVars, names(trainData))      # column numbers of the predictors
+gbmY <- match("presAbs", names(trainData))     # column number of the response
+```
+
+## Fit a model with cross-validation (`gbm.step`)
+
+`gbm.step()` grows the model in steps of 50 trees, using 10-fold cross-validation to track the predictive deviance as trees are added, and stops once the deviance stops improving. It then refits the model to all the training data with the best number of trees. Both the cross-validation folds and the bag fraction (each tree is fit to a random half of the data) are random, so we set a seed first.
+
+```{r}
+set.seed(2468)
+brt1 <- gbm.step(data = trainData, gbm.x = gbmX, gbm.y = gbmY,
+                 family = "bernoulli", tree.complexity = 5,
+                 learning.rate = 0.01, bag.fraction = 0.5)
+```
+
+The plot shows the mean cross-validated deviance (solid curve, with dotted curves one standard error above and below) as trees are added. The red line marks the minimum of the mean, and the green line the number of trees at which it occurs.
+
+::: {.callout-tip title="Question"}
+With these settings, `gbm.step()` chose `r brt1$gbm.call$best.trees` trees. What does the tutorial's rule of thumb say about this, and what would you change?
+:::
+
+## Inspect the model
+
+`gbm.step()` keeps the cross-validated statistics, estimated on the held-out folds. "Discrimination" is the AUC.
+
+```{r}
+unlist(brt1$cv.statistics[c("deviance.mean", "deviance.se",
+                            "discrimination.mean", "discrimination.se")])
+```
+
+The relative influence of each variable (scaled to sum to 100) is based on how often the variable is used for splitting, weighted by how much each of those splits improves the model, averaged over all the trees:
+
+```{r}
+#| fig-height: 6
+par(mar = c(4, 17, 1, 1)) # wide left margin for the long variable names
+relInf <- summary(brt1, las = 1, cex.names = 0.7)
+relInf
+```
+
+::: {.callout-tip title="Question"}
+We know which variables we used to simulate the species. Did the model find them?
+:::
+
+## Plot the fitted functions
+
+`gbm.plot()` shows the partial dependence on each variable (on the logit scale), here for the 12 most influential variables. `gbm.plot.fits()` plots the fitted values against each predictor (it draws at most 16 panels, so it skips the last four layers).
+
+```{r}
+#| fig-height: 9
+#| fig-width: 8
+gbm.plot(brt1, n.plots = 12, plot.layout = c(4, 3), write.title = FALSE)
+```
+
+```{r}
+#| fig-height: 9
+#| fig-width: 8
+#| warning: false
+gbm.plot.fits(brt1)
+```
+
+## Interactions
+
+`gbm.interactions()` measures how strongly each pair of variables interacts in the fitted model. `gbm.perspec()` draws the fitted surface for a pair, holding the other variables at their means. Here is the strongest pair:
+
+```{r}
+#| fig-height: 6
+find.int <- gbm.interactions(brt1)
+head(find.int$rank.list)
+
+topPair <- find.int$rank.list[1, ]
+gbm.perspec(brt1, x = topPair$var1.index, y = topPair$var2.index)
+```
+
+::: {.callout-tip title="Question"}
+Our simulated species has an interaction between Isothermality and Mean.Temperature.of.Wettest.Quarter. Is that the pair the model ranks highest? Why might it not be?
+:::
+
+## Predict to the test set and to the map
+
+To predict, tell `predict()` how many trees to use: the number chosen by `gbm.step()`. The tutorial measures predictive performance with the deviance (`calc.deviance()`); we also compute the AUC.
+
+```{r}
+predTest <- predict(brt1, testData, n.trees = brt1$gbm.call$best.trees,
+                    type = "response")
+calc.deviance(obs = testData$presAbs, pred = predTest, calc.mean = TRUE) # mean deviance (lower is better)
+auc(testData$presAbs, predTest, quiet = TRUE)
+```
+
+`terra::predict()` applies the model to every cell of the raster stack (`na.rm = TRUE` skips cells with missing values):
+
+```{r}
+#| fig-height: 3.5
+#| fig-width: 10
+predMap <- terra::predict(envStack, brt1, n.trees = brt1$gbm.call$best.trees,
+                          type = "response", na.rm = TRUE)
+plot(c(pOccRaster, predMap), main = c("Truth", "BRT prediction"), range = c(0, 1))
+```
+
+## Simplifying the model
+
+The tutorial also shows `gbm.simplify()`, which uses cross-validation to test whether dropping the least important variables hurts predictive performance. It refits the model many times, so it is slow (several minutes with 20 predictors). Try it when you have time:
+
+```{r}
+#| eval: false
+set.seed(1357)
+brt1.simp <- gbm.simplify(brt1, n.drops = 10)
+```
+
+# Exercises
+
+::: {.callout-important title="Exercise 1"}
+After completing the tutorial, choose some aspect of BRTs that you are curious about and explore it further. Report on your motivation, design of your analysis, results, and conclusions.
+:::
+
+::: {.callout-important title="Exercise 2"}
+We used the same simulated species for BRTs as for RFs. Your task is to compare these models. You will need to consider how to tune parameters for a "peak-to-peak" comparison (i.e., you want your best BRT model vs. your best RF model rather than one of them being badly tuned). Please compare predictive performance on the test set (which you will need to decide how to measure) and interpretation of the models (variable importances/plots, predictive rasters, etc.). Report back on how you approached these tasks and what you found!
+
+(This lab samples its points a little differently from Lab 4, so fit both models to *this* lab's `trainData` and `testData`. Note that `randomForest()` does not accept missing values, so you'll need to decide what to do with points that have missing elevation.)
+:::
+
+# Turn in
+
+**(on Canvas, by the due date on Canvas)** Please post to the online discussion of this lab. Please include brief descriptions of your exploration of the exercise, with any relevant plots. Please also include, if applicable:
+
+* Any key take-aways from this lab that you want to remember for any future projects you may conduct in which you use species distribution models.
+* Any remaining questions or confusions do you have that you might like to learn more about.
+
+# Further Resources
+
+Elith, J., Leathwick, J. R., & Hastie, T. (2008). A working guide to boosted regression trees. *Journal of Animal Ecology*, 77(4), 802-813. <https://doi.org/10.1111/j.1365-2656.2008.01390.x>
+
+Supplementary material from Elith et al. (2008): Appendix S3 (the original tutorial, R code, and data), in the article's Supporting Information at <https://doi.org/10.1111/j.1365-2656.2008.01390.x>.
+
+[gbm vignette](https://cran.r-project.org/web/packages/gbm/vignettes/gbm.html): Ridgeway, G. Generalized Boosted Models: A guide to the gbm package.
+
+Technical statistical foundations:
+
+Friedman, J. (2001). Greedy function approximation: a gradient boosting machine. *Annals of Statistics*, 29(5), 1189-1232. <https://doi.org/10.1214/aos/1013203451>
+
+Friedman, J. (2002). Stochastic gradient boosting. *Computational Statistics & Data Analysis*, 38(4), 367-378. <https://doi.org/10.1016/S0167-9473(01)00065-2>

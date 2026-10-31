@@ -1,0 +1,480 @@
+---
+title: "Lab 3: Classification and Regression Trees (CART)"
+subtitle: "FW 532 · Python version"
+---
+
+**Goals:** To understand how classification and regression trees are built and interpreted in
+Python.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* Python packages: numpy, pandas, matplotlib, scikit-learn, rasterio (see `requirements.txt`)
+* The course helper module `sdmlab.py` (in the same folder as this notebook)
+
+Run the cells in order from top to bottom: later cells use variables created by earlier ones.
+
+```{python}
+# Running on Google Colab? This cell downloads the course files. (Anywhere else it does nothing.)
+import os, sys
+if "google.colab" in sys.modules:
+    if not os.path.exists("/content/fw532"):
+        !git clone -q --depth 1 https://github.com/Hutchinson-Lab/fw532.git /content/fw532
+        %pip install -q rasterio
+    os.chdir("/content/fw532/python")
+```
+
+# Setup
+
+The R version of this lab uses the `rpart` package. In Python, classification and regression
+trees are in scikit-learn's `sklearn.tree` module.
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
+from sklearn.tree import DecisionTreeClassifier, plot_tree, export_text
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+
+import sdmlab as sdm   # course helpers for rasters
+
+env_stack = sdm.load_env()
+```
+
+# Simulate Data
+
+We will use simulated data again in the exercises below. Since trees can handle nonlinearities
+and interactions, let's use a more complex species simulation this week. Note that we don't need
+to scale the environmental variables for modeling, as it doesn't matter to a tree. We'll still
+scale them to generate the species, since there we're setting up a (non)linear equation and it's
+easier to think about the coefficients when the variables are scaled.
+
+```{python}
+# define logistic function
+def logistic(x):
+    return np.exp(x) / (1 + np.exp(x))
+
+# get points
+n_points = 1000
+sim_pts = env_stack.sample_random(n_points, seed=1234)
+
+# set parameters
+intercept = -0.25
+beta1 = -1
+beta2 = 1
+beta3 = 1.5
+beta4 = 1
+beta5 = -1
+mdr = sdm.scale(env_stack["Mean.Diurnal.Range"])
+iso = sdm.scale(env_stack["Isothermality"])
+mtwq = sdm.scale(env_stack["Mean.Temperature.of.Wettest.Quarter"])
+p_occ = logistic(intercept
+                 + beta1 * mdr
+                 + beta2 * iso
+                 + beta3 * mtwq
+                 + beta4 * mdr**2        # quadratic term
+                 + beta5 * iso * mtwq)   # interaction term
+
+# get the values that correspond to the points we selected:
+p_occs = sdm.extract(p_occ, env_stack, sim_pts["x"], sim_pts["y"])
+
+# sample from these probabilities (a *different* seed for a different random step; see Lab 1):
+rng = np.random.default_rng(5678)
+pres_abs = rng.binomial(n=1, p=p_occs)
+
+# put response and variables together in a DataFrame:
+modeling_df = sim_pts.copy()
+modeling_df.insert(0, "presAbs", pres_abs)
+
+# plot the result
+ax = sdm.plot_map(p_occ, env_stack, title="Probability of occurrence")
+absent = modeling_df["presAbs"] == 0
+ax.scatter(modeling_df.loc[~absent, "x"], modeling_df.loc[~absent, "y"], s=6, color="red", label="detection")
+ax.scatter(modeling_df.loc[absent, "x"], modeling_df.loc[absent, "y"], s=6, color="blue", label="non-detection")
+ax.legend(loc="center left");
+```
+
+```{python}
+# split into training and test
+train_data = modeling_df.iloc[:n_points // 2]   # rows 0-499
+test_data = modeling_df.iloc[n_points // 2:]    # rows 500-999
+```
+
+(The sampled points come back in random order, so taking the first half for training and the
+second half for testing is a random split. `//` is integer division: `1000 // 2` is `500`.)
+
+Because Python's random numbers differ from R's, your points, presences, and therefore your trees
+will not match the R version exactly. The ideas are the same.
+
+# Classification Trees
+
+Let's assume we either have some prior knowledge of the species or have done some exploratory
+modeling to select good variables. Here, we'll fit and plot a basic classification tree with only
+the relevant variables.
+
+scikit-learn's `DecisionTreeClassifier` grows a CART tree with the Gini index, like rpart, but its
+defaults are very different. Out of the box it keeps splitting until the leaves are pure, and it
+does **not** prune. rpart, by default, only tries to split nodes with at least 20 points, needs at
+least 7 points in every leaf, and prunes away splits that don't improve the fit enough (`cp =
+0.01`). Here is how the settings line up:
+
+| rpart (`rpart.control`) | scikit-learn (`DecisionTreeClassifier`) | Notes |
+|---|---|---|
+| `minsplit = 20` | `min_samples_split` (default 2) | smallest node we try to split |
+| `minbucket = 7` (= minsplit/3) | `min_samples_leaf` (default 1) | smallest allowed leaf |
+| `maxdepth = 30` | `max_depth` (default `None`, no limit) | root is depth 0 in both |
+| `cp = 0.01` | `ccp_alpha` (default 0, no pruning) | both are cost-complexity pruning, but on different scales (below) |
+| `xval = 10` | no equivalent | sklearn does no internal cross-validation; use `cross_val_score` |
+| `method = "class"` / `"anova"` | `DecisionTreeClassifier` / `DecisionTreeRegressor` | |
+
+Cost-complexity pruning removes a split unless it improves the fit by more than a penalty per
+leaf. rpart's `cp` is a *fraction of the error at the root*, where error is the misclassification
+rate. sklearn's `ccp_alpha` is in *absolute* units of Gini impurity. A rough translation is
+`ccp_alpha = cp × (Gini impurity at the root)`. Because the two packages measure the fit
+differently (misclassification vs. Gini), this gives a tree of *similar* complexity to rpart's
+default, not an identical one.
+
+```{python}
+pred_vars = ["Mean.Diurnal.Range", "Isothermality", "Mean.Temperature.of.Wettest.Quarter"]
+X_train, y_train = train_data[pred_vars], train_data["presAbs"]
+X_test, y_test = test_data[pred_vars], test_data["presAbs"]
+
+# translate rpart's default cp = 0.01 into sklearn's ccp_alpha
+prevalence = y_train.mean()
+root_gini = 2 * prevalence * (1 - prevalence)   # Gini impurity of the root (all training points)
+rpart_like_alpha = 0.01 * root_gini
+print(f"ccp_alpha = {rpart_like_alpha:.4f}")
+
+mod1 = DecisionTreeClassifier(min_samples_split=20, min_samples_leaf=7,
+                              ccp_alpha=rpart_like_alpha, random_state=0)
+mod1.fit(X_train, y_train)
+print("number of leaves:", mod1.get_n_leaves())
+```
+
+(`random_state` only breaks ties between equally good splits; fixing it makes the tree repeatable.)
+
+`plot_tree()` draws the tree. Each box shows the split, the number of training points that reached
+the node (`samples`), how many of them were absences and presences (`value = [absences,
+presences]`, like `use.n = TRUE` in R), and the predicted class. In scikit-learn, points that meet
+the condition (`<=`) always go **left**. Boxes are colored by the predicted class (orange = 0,
+blue = 1); darker colors mean purer nodes.
+
+```{python}
+def draw_tree(model, feature_names, figsize=(16, 10), fontsize=9):
+    """Draw a fitted tree with counts of absences and presences in each node."""
+    fig, ax = plt.subplots(figsize=figsize)
+    plot_tree(model, feature_names=feature_names, class_names=["0", "1"],
+              filled=True, impurity=False, rounded=True, precision=2,
+              fontsize=fontsize, ax=ax)
+    return ax
+
+draw_tree(mod1, pred_vars);
+```
+
+`export_text()` prints the same tree as text (`weights` are the numbers of training absences and
+presences in each leaf):
+
+```{python}
+print(export_text(mod1, feature_names=pred_vars, show_weights=True))
+```
+
+Let's take a closer look at the splits in the tree. The fitted tree is stored in `mod1.tree_` as a
+set of arrays with one entry per node. Node 0 is the root. For each node, `feature` and `threshold`
+give its split, and `children_left` / `children_right` give the numbers of its two child nodes
+(`-1` means there are none, i.e. the node is a leaf).
+
+```{python}
+tree1 = mod1.tree_
+
+root_var = pred_vars[tree1.feature[0]]   # the variable used at the root (node 0)
+root_value = tree1.threshold[0]          # the split value
+print(f"At the root, we split on {root_var} at the value {root_value:.2f}.")
+```
+
+This partitions the data into two chunks. First let's see the split in environmental space:
+
+```{python}
+root_values = modeling_df[root_var]
+hist_bins = np.histogram_bin_edges(root_values, bins=15)   # the same bins for presences and absences
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.hist(root_values[modeling_df["presAbs"] == 1], bins=hist_bins, color="red", alpha=0.25,
+        edgecolor="black", label="presences")
+ax.hist(root_values[modeling_df["presAbs"] == 0], bins=hist_bins, color="blue", alpha=0.25,
+        edgecolor="black", label="absences")
+ax.axvline(root_value, color="green", linewidth=2)
+ax.set_title(f"Histogram of {root_var}\n(red are values at presences;\nblue are values at absences)")
+ax.set_xlabel(root_var)
+ax.set_ylabel("Frequency");
+```
+
+We can also look at how this split translates into geographic space (even though it originated
+solely in environmental space). Every node of the tree corresponds to a region of the map: the
+cells that meet *all* of the conditions on the path from the root down to that node. The small
+helper function below turns a list of conditions into a map.
+
+```{python}
+def region_from_path(conditions, env):
+    """Map the cells that meet every condition in `conditions`.
+
+    Each condition is a tuple (variable, "<=" or ">", value). Returns a 2-D array that is
+    1 inside the region, 0 outside it, and NaN in the ocean.
+    """
+    region = np.ones(env.shape)                    # start with everywhere...
+    for var, op, value in conditions:
+        layer = env[var]
+        if op == "<=":
+            meets = layer <= value
+        else:
+            meets = layer > value
+        region = np.where(meets, region, 0)        # ...and keep only cells meeting each condition
+        region[np.isnan(layer)] = np.nan           # no data (ocean) stays NaN
+    return region
+
+
+def node_counts(model, node):
+    """Numbers of training absences (0) and presences (1) that reached a node."""
+    t = model.tree_
+    fractions = t.value[node][0]                    # the class fractions in the node
+    return np.round(fractions * t.n_node_samples[node]).astype(int)
+
+
+def plot_region(region, title, points=train_data):
+    """Draw a region (green) on the map with the training presences (red) and absences (blue)."""
+    ax = sdm.plot_map(region, env_stack, title=title, colorbar=False,
+                      cmap=ListedColormap(["lightgrey", "lightgreen"]), vmin=0, vmax=1)
+    pres = points["presAbs"] == 1
+    ax.scatter(points.loc[pres, "x"], points.loc[pres, "y"], s=6, color="red")
+    ax.scatter(points.loc[~pres, "x"], points.loc[~pres, "y"], s=6, color="blue")
+    ax.legend(handles=[Patch(color="lightgrey", label="False"), Patch(color="lightgreen", label="True")],
+              loc="upper left", bbox_to_anchor=(1, 1))
+    return ax
+
+
+# the root's left branch: cells where root_var <= root_value
+root_region = region_from_path([(root_var, "<=", root_value)], env_stack)
+plot_region(root_region, "Region corresponding to root level split");
+```
+
+```{python}
+right = tree1.children_right[0]   # node number of the root's right branch
+counts = node_counts(mod1, right)
+print("Is the root's right branch a leaf?", tree1.children_left[right] == -1)
+print(f"Training absences and presences in the right branch (the grey region): {counts}")
+print("Predicted class there:", mod1.classes_[np.argmax(counts)])
+```
+
+The right branch of the root covers the grey (as opposed to green) region above. If it is a
+terminal node, or leaf node, the tree predicts the same class (printed above) for every point in
+that region; otherwise it keeps splitting.
+
+Why was this split chosen? It had the highest Gini gain among all candidate splits (all possible
+variables at all possible split points).
+
+Continuing, the left branch of the root continues splitting before reaching a leaf node. We can
+find the leftmost leaf node in the tree by following the splits: start at the root and keep taking
+the left child until we reach a node with no children. Along the way we record each condition.
+
+```{python}
+node = 0                      # start at the root
+leaf_path = []                # the conditions on the way down
+while tree1.children_left[node] != -1:          # -1 = no children, so we have reached a leaf
+    var = pred_vars[tree1.feature[node]]
+    leaf_path.append((var, "<=", tree1.threshold[node]))   # going left means "<= threshold"
+    node = tree1.children_left[node]
+leftmost_leaf = node
+
+print("Leftmost leaf: node", leftmost_leaf)
+for var, op, value in leaf_path:
+    print(f"   {var} {op} {value:.3f}")
+
+leaf_counts = node_counts(mod1, leftmost_leaf)
+print(f"Training absences and presences in this leaf: {leaf_counts}")
+print("Predicted class:", mod1.classes_[np.argmax(leaf_counts)])
+print("Variables along this path:", sorted({var for var, op, value in leaf_path}))
+```
+
+(`{... for ...}` builds a *set*, which keeps only the unique variable names.)
+
+This node corresponds to areas that meet **all** of the conditions printed above. If more than one
+variable appears along the path, the leaf represents an interaction: with 2 variables on the path,
+for example, the effect of one variable depends on the value of the other (a 2-way interaction).
+This is a terminal node, and the tree predicts the class printed above in the green region shown
+below, based on the numbers of training absences (blue) and presences (red) that fell into this
+leaf.
+
+```{python}
+leaf_region = region_from_path(leaf_path, env_stack)
+plot_region(leaf_region, "Region corresponding to leftmost leaf node");
+```
+
+So how well does this tree predict the test data? `predict_proba()` returns one column per class;
+column 1 is the predicted probability of presence.
+
+```{python}
+train_preds1 = mod1.predict_proba(X_train)[:, 1]
+test_preds1 = mod1.predict_proba(X_test)[:, 1]
+
+print(f"Train AUC: {roc_auc_score(y_train, train_preds1):.4f}")
+print(f"Test AUC:  {roc_auc_score(y_test, test_preds1):.4f}")
+```
+
+How does all of this change if we modify the tree complexity? There are a few control options that
+affect tree complexity (see the table above for the rpart names):
+
+* `min_samples_split` is the minimum number of points that must fall into a node to attempt
+  splitting (rpart's default is 20; sklearn's is 2);
+* `min_samples_leaf` is the minimum number of points in a terminal/leaf node (rpart's default is
+  minsplit/3; sklearn's is 1);
+* `ccp_alpha` is a complexity parameter that removes splits that improve fit by less than this
+  amount (rpart's `cp`; sklearn's default is 0, no pruning);
+* `max_depth` is the maximum depth of the tree where the root is 0 (rpart's default is 30;
+  sklearn's is no limit).
+
+In R, setting `minbucket = 20` also makes rpart set `minsplit = 60`, so we set both here.
+
+```{python}
+mod2 = DecisionTreeClassifier(min_samples_split=60, min_samples_leaf=20,
+                              ccp_alpha=rpart_like_alpha, random_state=0)
+mod2.fit(X_train, y_train)
+draw_tree(mod2, pred_vars);
+```
+
+```{python}
+# like rpart's cp = 0: no pruning (but keep the minimum node sizes)
+mod3 = DecisionTreeClassifier(min_samples_split=20, min_samples_leaf=7, ccp_alpha=0, random_state=0)
+mod3.fit(X_train, y_train)
+print("number of leaves:", mod3.get_n_leaves())
+draw_tree(mod3, pred_vars, figsize=(30, 16), fontsize=6);
+```
+
+rpart also does cross-validation internally and stores the cross-validated error for each value of
+`cp`, which you can use to choose `cp` and "prune" the tree (remove leaf nodes that don't help
+"enough" or don't generalize well). sklearn doesn't do this for you, but we can do it ourselves:
+
+1. `cost_complexity_pruning_path()` lists the values of `ccp_alpha` at which the full tree loses
+   one more split.
+2. For each value, `cross_val_score()` fits the tree on 9/10 of the training data and tests it on
+   the remaining 1/10, ten times (10-fold cross-validation, like rpart's `xval = 10`).
+3. We keep the value with the lowest cross-validated error (misclassification rate, as in rpart's
+   `xerror`).
+
+```{python}
+pruning_path = mod3.cost_complexity_pruning_path(X_train, y_train)
+alphas = pruning_path.ccp_alphas   # from 0 (the full tree) up to a value that leaves only the root
+
+folds = StratifiedKFold(n_splits=10, shuffle=True, random_state=2468)  # folds are assigned at random
+cv_error = []
+n_leaves = []
+for alpha in alphas:
+    tree = DecisionTreeClassifier(min_samples_split=20, min_samples_leaf=7, ccp_alpha=alpha, random_state=0)
+    accuracy = cross_val_score(tree, X_train, y_train, cv=folds, scoring="accuracy")
+    cv_error.append(1 - accuracy.mean())
+    n_leaves.append(tree.fit(X_train, y_train).get_n_leaves())
+
+cv_table = pd.DataFrame({"ccp_alpha": alphas, "n_leaves": n_leaves, "cv_error": cv_error})
+print(cv_table.round(4))
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.plot(cv_table["n_leaves"], cv_table["cv_error"], "o-")
+ax.set_xlabel("size of tree (number of leaves)")
+ax.set_ylabel("cross-validated misclassification rate");
+```
+
+```{python}
+# prune back to the ccp_alpha with the lowest cross-validated error
+best_alpha = cv_table.loc[cv_table["cv_error"].idxmin(), "ccp_alpha"]
+mod3_pruned = DecisionTreeClassifier(min_samples_split=20, min_samples_leaf=7,
+                                     ccp_alpha=best_alpha, random_state=0)
+mod3_pruned.fit(X_train, y_train)
+print(f"best ccp_alpha = {best_alpha:.4f}; number of leaves: {mod3_pruned.get_n_leaves()}")
+draw_tree(mod3_pruned, pred_vars);
+```
+
+How is the tree affected if we include more variables? Here's an example with the first 12
+WORLDCLIM variables. We can look at predictive performance of this model on the training and test
+data sets.
+
+There is also a variable importance measure in the model, `feature_importances_`. It is not the
+same as rpart's. sklearn reports the *Gini importance* (also called mean decrease in impurity):
+the total decrease in Gini impurity from all splits on a variable, weighted by the number of points
+reaching those splits and scaled to sum to 1. rpart's `variable.importance` also gives credit to
+variables that act as *surrogate* splits (backups used for missing values), so a variable can be
+important in rpart without appearing in the tree. sklearn has no surrogate splits (when there are
+missing values, it sends them down whichever branch works better), so a variable that never appears
+in the tree has importance 0.
+
+```{python}
+vars12 = env_stack.names[:12]   # the first 12 layers
+print(vars12)
+
+mod4 = DecisionTreeClassifier(min_samples_split=20, min_samples_leaf=7,
+                              ccp_alpha=rpart_like_alpha, random_state=0)
+mod4.fit(train_data[vars12], y_train)
+draw_tree(mod4, vars12, figsize=(20, 9), fontsize=7);
+```
+
+```{python}
+train_preds4 = mod4.predict_proba(train_data[vars12])[:, 1]
+test_preds4 = mod4.predict_proba(test_data[vars12])[:, 1]
+print(f"Train AUC: {roc_auc_score(y_train, train_preds4):.4f}")
+print(f"Test AUC:  {roc_auc_score(y_test, test_preds4):.4f}")
+
+importance4 = pd.Series(mod4.feature_importances_, index=vars12).sort_values(ascending=False)
+print(importance4.round(3))
+```
+
+Note that while we have explored a classification example (presence vs. absence), trees work for
+regression too. The key difference is the criterion for choosing split points (in sklearn, use
+`DecisionTreeRegressor`, which by default chooses splits that reduce the squared error, like
+rpart's `method = "anova"`).
+
+# Disadvantages
+
+We have seen some of the advantages of trees, like flexibility and interpretability, above. One
+disadvantage of trees is that they have high variance. Consider fitting trees to replicate
+bootstrap samples of the training data. Ideally, we'd like to get very similar trees (the same
+'story' about the data) from the different samples.
+
+> **Exercise 1:** Run the next cell on bootstraps of the training data 10 or so times and check out
+> the differences in trees, predictive performance, and variable importance.
+
+```{python}
+# no seed here on purpose: each run draws a different bootstrap sample
+train_data_samp = train_data.sample(n=len(train_data), replace=True)
+mod5 = DecisionTreeClassifier(min_samples_split=20, min_samples_leaf=7,
+                              ccp_alpha=rpart_like_alpha, random_state=0)
+mod5.fit(train_data_samp[pred_vars], train_data_samp["presAbs"])
+draw_tree(mod5, pred_vars)
+plt.show()
+
+train_preds5 = mod5.predict_proba(train_data_samp[pred_vars])[:, 1]
+print(f"Train (bootstrap sample) AUC: {roc_auc_score(train_data_samp['presAbs'], train_preds5):.4f}")
+
+test_preds5 = mod5.predict_proba(X_test)[:, 1]
+print(f"Test AUC: {roc_auc_score(y_test, test_preds5):.4f}")
+
+print(pd.Series(mod5.feature_importances_, index=pred_vars).round(3))
+```
+
+# Turn in
+
+**(on Canvas, by the due date on Canvas)** Please post to the online discussion of this lab. Please
+include brief descriptions of your exploration of the exercise, with any relevant plots. Please also
+include, if applicable:
+
+* Any key take-aways from this lab that you want to remember for any future projects you may
+  conduct in which you use species distribution models.
+* Any remaining questions or confusions do you have that you might like to learn more about.
+
+# Further Resources
+
+* [rpart vignette](https://cran.r-project.org/web/packages/rpart/vignettes/longintro.pdf) (the R
+  package, but a clear explanation of how CART works)
+* [scikit-learn user guide: decision trees](https://scikit-learn.org/stable/modules/tree.html)
+* [scikit-learn example: post pruning decision trees with cost complexity pruning](https://scikit-learn.org/stable/auto_examples/tree/plot_cost_complexity_pruning.html)

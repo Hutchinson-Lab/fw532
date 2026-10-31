@@ -1,0 +1,506 @@
+---
+title: "Lab 2: Evaluation: Metrics and Cross-Validation"
+subtitle: "FW 532 · R version"
+---
+
+**Goals:**
+
+* To understand what each of a set of common evaluation metrics measures, how the metrics do/don't depend on the prediction threshold, and how to compute them in R.
+* To implement several cross-validation strategies and explore trade-offs within and among them.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* R packages: terra, caret, pROC, PRROC, sf, blockCV, here (all installed by `source("install_packages.R")`)
+
+```{r}
+#| message: false
+library(terra)      # rasters (gridded maps)
+library(caret)      # confusion matrices and stratified folds
+library(pROC)       # ROC curves and AUC
+library(PRROC)      # precision-recall curves
+library(sf)         # spatial points (for the blockCV bonus section)
+library(here)       # file paths relative to the project folder
+
+envStack <- rast(here("data", "envStack.tif"))
+```
+
+# SET-UP
+
+In the last lab, you simulated some data and fit at least one model. You looked at parameter estimates and the predicted probability surface for the simulated species. Since it was simulated, we could directly ask how well the fitted model estimated the parameter values. Of course, in reality, you don't already know how the data were generated - this is why you're fitting a model! In this lab, we will dig into different ways to measure the quality of your model.
+
+To set up, we'll create a simulated data set again. We'll divide it into two pieces: a "training set" for fitting the model, and a "testing set" for evaluating the model. At first, we'll divide it arbitrarily, and in the second part of the lab, we'll look at other possible set-ups.
+
+# Simulate Data
+
+This block simulates presence/absence data, for which we'll look at a suite of evaluation metrics.
+
+```{r}
+# define logistic function
+logistic <- function(x) { exp(x) / (1 + exp(x)) }
+
+# scale the climate variables (each layer gets mean 0 and standard deviation 1, as in Lab 1):
+envStack <- scale(envStack)
+
+# get points
+nPoints <- 500
+#nPoints <- 3000
+set.seed(1234)
+simPts <- spatSample(envStack, size = nPoints, method = "random",
+                     na.rm = TRUE, xy = TRUE)
+
+# set parameters
+intercept <- -1.5
+beta1 <- -1.5
+beta2 <- -1.5
+beta3 <- 1.5
+pOccRaster <- logistic(intercept +
+                         beta1 * scale(envStack$Precipitation.Seasonality) +
+                         beta2 * scale(envStack$Min.Temperature.of.Coldest.Month) +
+                         beta3 * scale(envStack$Mean.Temperature.of.Wettest.Quarter))
+names(pOccRaster) <- "pOcc"
+
+# get the values that correspond to the points we selected:
+pOccs <- extract(pOccRaster, simPts[, c("x", "y")], ID = FALSE)$pOcc
+
+# sample from these probabilities (a *different* seed than above -- see Lab 1):
+set.seed(5678)
+presAbs <- rbinom(n = nPoints, size = 1, prob = pOccs)
+
+# put response and variables together in a data.frame:
+modelingDF <- cbind(presAbs, simPts)
+
+# plot the result
+plot(pOccRaster)
+points(modelingDF$x[modelingDF$presAbs == 0], modelingDF$y[modelingDF$presAbs == 0],
+       col = "blue", pch = 20)
+points(modelingDF$x[modelingDF$presAbs == 1], modelingDF$y[modelingDF$presAbs == 1],
+       col = "red", pch = 20)
+legend("left", c("detection", "non-detection"), col = c("red", "blue"), pch = c(20, 20))
+```
+
+Let's make half of these training points and half test points at random. (`spatSample()` returns the points in random order, so the first half and the second half are each a random sample.)
+
+```{r}
+trainData <- modelingDF[1:floor(nPoints / 2), ]
+testData <- modelingDF[(floor(nPoints / 2) + 1):nPoints, ]
+```
+
+# Fit a basic model
+
+Now you can fit a simple model to these data. Let's suppose your model is not perfect - you fail to include "Min.Temperature.of.Coldest.Month" and instead include "Precipitation.of.Coldest.Quarter." Using this model, you can get predicted probabilities for the test points.
+
+```{r}
+model1 <- glm(formula = presAbs ~ Precipitation.Seasonality +
+                Precipitation.of.Coldest.Quarter +
+                # Min.Temperature.of.Coldest.Month +
+                Mean.Temperature.of.Wettest.Quarter,
+              data = trainData,
+              family = "binomial")
+
+predProbs <- predict(model1,
+                     testData,
+                     type = "response")
+
+head(cbind(pred = round(predProbs, digits = 2), truth = testData$presAbs))
+```
+
+Now your model has made some predictions about the test points on the probability scale. Your test data includes 0s for absences and 1s for presences. Your task is to choose how to measure the agreement (or lack thereof) between your model predictions and the test data.
+
+# PART 1: METRICS
+
+# Thresholded metrics
+
+As you go through this section, you might find this to be a useful reference: [Classifier evaluation](https://en.wikipedia.org/wiki/Evaluation_of_binary_classifiers)
+
+One option is to threshold the predictions to turn them into 0s and 1s like the response variable in your test data. To do this, you must choose a threshold. For starters, use 0.5, since it is halfway between 0 and 1.
+
+```{r}
+thresh <- 0.5 # set the threshold
+logicalPreds <- predProbs > thresh # threshold the predictions
+binaryPreds <- as.numeric(logicalPreds) # convert to binary instead of logical
+head(cbind(pred = round(predProbs, digits = 2), truth = testData$presAbs, binaryPreds))
+```
+
+Now you can use a confusion matrix to compare the predictions to the observations. A confusion matrix has four cells. The caret package has functions to compute confusion matrices and a suite of summary metrics for them. You may find the help page useful (run this line in the Console):
+
+```{r}
+#| eval: false
+?caret::confusionMatrix
+```
+
+Here is our first confusion matrix and associated metrics:
+
+```{r}
+# this takes the predicted data (thresholded) and the true labels
+# - both as factors - along with an indication of which class should
+# be treated as positive. Setting levels = c(0, 1) keeps both classes
+# even if a threshold makes every prediction the same:
+cm <- caret::confusionMatrix(factor(binaryPreds, levels = c(0, 1)),
+                             factor(testData$presAbs, levels = c(0, 1)),
+                             positive = "1")
+cm
+```
+
+(Note that this package arranges the cells of the matrix differently than the wikipedia page.) Please make sure you understand at least: accuracy, no information rate, kappa, sensitivity, specificity, and positive predictive value. Note that many of these have more than one name! You can cross-reference with the Wikipedia page.
+
+Another metric that you may see in ecology but is not automatically computed here is the True Skill Statistic (TSS) = Sensitivity + Specificity - 1 (e.g., Allouche et al (2006) below).
+
+```{r}
+sens <- caret::sensitivity(factor(binaryPreds, levels = c(0, 1)),
+                           factor(testData$presAbs, levels = c(0, 1)), positive = "1")
+spec <- caret::specificity(factor(binaryPreds, levels = c(0, 1)),
+                           factor(testData$presAbs, levels = c(0, 1)), negative = "0")
+
+tss <- sens + spec - 1
+tss
+```
+
+There are many choices here for measuring success with binary outcomes (i.e., presence/absence data)! You are encouraged to think about which of these might be most relevant for different modeling scenarios. Which is the best characterization of model success for your project?
+
+All of the above has compared binary predictions to binary true values, where the binary predictions were created by thresholding model outputs between 0 and 1. Therefore, the confusion matrix and associated metrics will change as the threshold varies. You can prove this to yourself by trying a different threshold. There are a variety of ways to choose your threshold. Once again, there are choices in how to set the threshold. You could use information from the training data. For example, you could take the fitted probabilities on the training data and use the minimum probability among all positive training points, so that the model would predict all the positives correctly on the training data.
+
+```{r}
+minTrainPresThresh <- min(model1$fitted.values[which(trainData$presAbs == 1)])
+minTrainPresThresh
+```
+
+Or, you could ask to predict 90% of the training positives correctly, etc.
+
+```{r}
+ninetyPercentPresThresh <- quantile(model1$fitted.values[which(trainData$presAbs == 1)], 0.1)
+ninetyPercentPresThresh
+```
+
+Or just use the training set prevalence: here, the proportion of 0s in the training data (1 - prevalence).
+
+```{r}
+trainPrevThresh <- 1 - mean(trainData$presAbs)
+trainPrevThresh
+```
+
+Another approach would be to choose the threshold based on sensitivity and specificity (e.g. the threshold at which they are equal, the threshold that maximizes their sum). This entails searching through a set of thresholds.
+
+::: {.callout-important title="Exercise 1"}
+Choose one of these alternate thresholds and compute the metrics again. Report what threshold you chose and comment on your results.
+:::
+
+# Threshold-independent metrics
+
+Alternatively, you may wish to avoid all this thresholding business. ROC curves plot performance across all possible thresholds. The area under these curves summarizes performance into threshold-independent measures. The pROC package can plot these, compute the area under them, and compute confidence intervals on them. (Note that pROC puts specificity on the x-axis, running from 1 down to 0; many other sources plot 1 - specificity, the false positive rate, running from 0 to 1. It is the same curve.)
+
+```{r}
+# create an ROC object for these data:
+ROCcurve <- roc(response = testData$presAbs, predictor = predProbs)
+plot(ROCcurve) # plot it
+plot(smooth(ROCcurve), add = TRUE, col = "blue") # add a smoothed version
+# make a confidence interval object for the curve
+# (this uses bootstrap resampling, so we set a seed to make it repeatable):
+set.seed(2468)
+curveCI <- ci(ROCcurve, of = "thresholds")
+plot(curveCI, col = "grey") # plot it with grey error bars
+```
+
+```{r}
+auc(ROCcurve) # get the area under the curve
+ci(ROCcurve) # get a confidence interval for the AUC
+```
+
+```{r}
+coords(ROCcurve, x = "best") # get details for the best point on the curve
+```
+
+Partial ROC curves were mentioned by Lobo et al (2008) as an alternative to AUC. The pROC package calculates these through the AUC function:
+
+```{r}
+# AUC clipped to specificity between 0.3 and 0.7
+auc(ROCcurve, partial.auc = c(0.3, 0.7))
+```
+
+Sensitivity and specificity are not the only metrics that trade-off as the threshold changes. We can also look at precision and recall, with precision-recall curves.
+
+```{r}
+pr <- pr.curve(scores.class0 = predProbs, weights.class0 = testData$presAbs, curve = TRUE)
+plot(pr)
+```
+
+Thought experiment: Suppose that your study extent is much larger than necessary - imagine a species endemic to Oregon but with surveys across North America. We can approximate this by adding more negatives to the dataset. Suppose these are 'easy' negatives, so the model predicts a very low probability of occurrence at all of them - say, 0.0001.
+
+The new data are:
+
+```{r}
+nNewPoints <- 1000
+newObs <- c(testData$presAbs, rep(0, nNewPoints))
+newPreds <- c(predProbs, rep(0.0001, nNewPoints))
+```
+
+::: {.callout-important title="Exercise 2"}
+Plot the original ROC and PR curves, and add new curves to the plots for the data augmented with easily-predicted negatives. What do you notice?
+:::
+
+# PART 2: CROSS-VALIDATION
+
+# Models To Fit
+
+As a benchmark, let's look at the true model that generated the data, fit to all the data and evaluated on all the data (resubstitution). This is basically as well as we can hope to do, and note that it is not actually perfect, due to the inherent stochasticity/noise.
+
+```{r}
+# fit the true model on all the data:
+trueFormula <- presAbs ~ Precipitation.Seasonality +
+  Min.Temperature.of.Coldest.Month +
+  Mean.Temperature.of.Wettest.Quarter
+trueModel <- glm(trueFormula, data = modelingDF, family = "binomial")
+# evaluate with resubstitution:
+preds_true <- predict(trueModel, modelingDF, type = "response")
+ROC_true <- roc(response = modelingDF$presAbs, predictor = preds_true)
+auc(ROC_true)
+ci(ROC_true)
+```
+
+Since in the real world we always have some degree of model misspecification, let's use a slightly wrong model for the rest of our exploration. Suppose we fail to include Precipitation.Seasonality (variable 15) in the model, and include Precipitation.of.Driest.Month (variable 14) instead. Let's see how that model does, again using resubstitution. The gap between these is the price we pay for model misspecification in this case.
+
+```{r}
+# suppose we do NOT specify the model correctly:
+modelFormula <- presAbs ~ Min.Temperature.of.Coldest.Month +
+  Mean.Temperature.of.Wettest.Quarter +
+  Precipitation.of.Driest.Month
+
+# resubstitution:
+mod_resub <- glm(modelFormula, data = modelingDF, family = "binomial")
+preds_resub <- predict(mod_resub, modelingDF, type = "response")
+ROC_resub <- roc(response = modelingDF$presAbs, predictor = preds_resub)
+auc(ROC_resub)
+ci(ROC_resub)
+PRCurve_resub <- pr.curve(preds_resub, weights.class0 = modelingDF$presAbs, curve = TRUE)
+
+plot(ROC_true, col = "black")
+plot(ROC_resub, add = TRUE, col = "red")
+legend("bottomright", c("true", "resub"), col = c("black", "red"), lty = c(1, 1), lwd = c(2, 2))
+```
+
+# Train/Test Splits
+
+Now, instead of resubstitution, let's use some different splitting methods to divide the data into a training set and a test set.
+
+First, let's divide the points randomly in half.
+
+```{r}
+set.seed(12345)
+samp <- sample(nPoints, round(0.5 * nPoints))
+traindata <- modelingDF[samp, ]
+testdata <- modelingDF[-samp, ]
+# visualize the split: purple training set and gray test set
+plot(envStack[[1]])
+points(traindata$x, traindata$y, pch = 20, col = "purple")
+points(testdata$x, testdata$y, pch = 20, col = "gray")
+```
+
+Fit the model to these training data, predict on the test data, and evaluate with ROC.
+
+```{r}
+mod_rand <- glm(modelFormula, data = traindata, family = "binomial")
+preds_rand <- predict(mod_rand, testdata, type = "response")
+ROC_rand <- roc(response = testdata$presAbs, predictor = preds_rand)
+auc(ROC_rand)
+ci(ROC_rand)
+
+plot(ROC_true, col = "black")
+plot(ROC_resub, add = TRUE, col = "red")
+plot(ROC_rand, add = TRUE, col = "orange")
+legend("bottomright", c("true", "resub", "random"), col = c("black", "red", "orange"),
+       lty = c(1, 1, 1), lwd = c(2, 2, 2))
+```
+
+Next, let's split the data in half longitudinally, based on the median longitude among the observed points.
+
+```{r}
+midLong <- median(modelingDF$x)
+trainIdxs <- modelingDF$x >= midLong
+traindata <- modelingDF[trainIdxs, ]
+testIdxs <- modelingDF$x < midLong
+testdata <- modelingDF[testIdxs, ]
+# visualize the split: purple training set and gray test set
+plot(envStack[[1]])
+points(traindata$x, traindata$y, pch = 20, col = "purple")
+points(testdata$x, testdata$y, pch = 20, col = "gray")
+```
+
+Repeat the model fitting and evaluation procedures on this split:
+
+```{r}
+mod_half <- glm(modelFormula, data = traindata, family = "binomial")
+preds_half <- predict(mod_half, testdata, type = "response")
+ROC_half <- roc(response = testdata$presAbs, predictor = preds_half)
+auc(ROC_half)
+ci(ROC_half)
+
+plot(ROC_true, col = "black")
+plot(ROC_resub, add = TRUE, col = "red")
+plot(ROC_rand, add = TRUE, col = "orange")
+plot(ROC_half, add = TRUE, col = "green")
+legend("bottomright", c("true", "resub", "random", "long"),
+       col = c("black", "red", "orange", "green"), lty = c(1, 1, 1, 1), lwd = c(2, 2, 2, 2))
+```
+
+Splitting longitudinally might produce two dissimilar datasets (e.g., the elevation distribution across the two may be different). A variety of grid-based partitionings might result in more similar samples from the environmental space. Here, we can try just a 2x2 grid, with the opposing corners put into the same subset.
+
+```{r}
+midLat <- median(modelingDF$y)
+
+trainIdxs <- (modelingDF$x >= midLong & modelingDF$y >= midLat) |
+  (modelingDF$x < midLong & modelingDF$y < midLat)
+traindata <- modelingDF[trainIdxs, ]
+testIdxs <- (modelingDF$x < midLong & modelingDF$y >= midLat) |
+  (modelingDF$x >= midLong & modelingDF$y < midLat)
+testdata <- modelingDF[testIdxs, ]
+
+# assign to training and test:
+plot(envStack[[1]])
+points(traindata$x, traindata$y, pch = 20, col = "purple")
+points(testdata$x, testdata$y, pch = 20, col = "gray")
+```
+
+Repeat the modeling fitting and evaluation.
+
+```{r}
+mod_grid <- glm(modelFormula, data = traindata, family = "binomial")
+preds_grid <- predict(mod_grid, testdata, type = "response")
+ROC_grid <- roc(response = testdata$presAbs, predictor = preds_grid)
+auc(ROC_grid)
+ci(ROC_grid)
+
+plot(ROC_true, col = "black")
+plot(ROC_resub, add = TRUE, col = "red")
+plot(ROC_rand, add = TRUE, col = "orange")
+plot(ROC_half, add = TRUE, col = "green")
+plot(ROC_grid, add = TRUE, col = "blue")
+legend("bottomright", c("true", "resub", "random", "long", "grid"),
+       col = c("black", "red", "orange", "green", "blue"),
+       lty = c(1, 1, 1, 1, 1), lwd = c(2, 2, 2, 2, 2))
+```
+
+::: {.callout-tip title="Question 1"}
+Reflect on this set of simulations. What surprises you? What factors explain the results? Consider: prevalence (and its breakdown in the training/test sets), autocorrelation in the predictor left out of the model, etc. What changes to the data generation and testing process above do you think would have INCREASED the differences among the testing methods? What changes would have DECREASED the differences? [Note: I consider these questions to be nontrivial, so don't be intimidated if you don't have a complete explanation for everything! Please just give this some careful thought and share what you come up with.]
+:::
+
+# K-fold cross-validation
+
+The process above splits the data into one training set and one test set. An alternative is to split the data into $k$ sets, or 'folds,' and let each take a turn as the test set, using a model trained on everything else. The example below illustrates this process using the `caret::createFolds()` function. In addition to splitting into $k$ folds, this time, we'll stratify the folds by prevalence.
+
+```{r}
+k <- 5
+# giving createFolds() the response as a factor makes it stratify the folds, so each
+# fold gets about the same proportion of presences; list = FALSE returns a fold number per point
+set.seed(4321)
+foldAssgn <- createFolds(factor(modelingDF$presAbs), k = k, list = FALSE)
+table(fold = foldAssgn, presAbs = modelingDF$presAbs)
+# plot the folds, each in a different color
+foldCols <- rainbow(k)
+plot(envStack[[1]])
+points(modelingDF$x, modelingDF$y, pch = 20, col = foldCols[foldAssgn])
+```
+
+Here, we iterate over the folds, letting each take its turn as the test set while we train on all the others. In each case, we can record the test predictions to aggregate later and/or measure performance for the test fold individually.
+
+```{r}
+# set up a vector to store the test metric for each fold
+foldAUCs <- numeric(k)
+# also collect all the predictions into a single vector
+# (this vector will be filled bit by bit over the k folds)
+CVpreds <- numeric(nPoints)
+# loop over the folds, training on NOT this fold and testing on this fold
+for (f in 1:k) {
+  mod_f <- glm(modelFormula, data = modelingDF[foldAssgn != f, ], family = "binomial")
+  pred_f <- predict(mod_f, modelingDF[foldAssgn == f, ], type = "response")
+  CVpreds[foldAssgn == f] <- pred_f
+  roc_f <- roc(response = modelingDF$presAbs[foldAssgn == f], predictor = pred_f,
+               quiet = TRUE) # quiet = TRUE skips pROC's messages
+  foldAUCs[f] <- auc(roc_f)
+} # f
+
+# we can get a single AUC from the vector of predictions we collected over the folds
+CVroc <- roc(response = modelingDF$presAbs, predictor = CVpreds)
+auc(CVroc)
+ci(CVroc)
+```
+
+```{r}
+# or we can average the individual AUCs over the folds
+foldAUCs
+mean(foldAUCs)
+sd(foldAUCs)
+```
+
+::: {.callout-important title="Exercise 3"}
+Try this with a few different numbers of folds. Report on your observations. What are some considerations that might guide your choice of the number of folds?
+:::
+
+# BONUS SECTION (optional): BlockCV
+
+Those of you that are particularly interested in structured CV may wish to explore the blockCV package. It is installed by `install_packages.R`, and you can get started with the snippets below. There's a vignette you can find by typing `??blockCV` at the prompt in your console for further guidance.
+
+```{r}
+#| message: false
+#| warning: false
+library(blockCV)
+```
+
+```{r}
+# blockCV works with sf points; crs = 4326 says the coordinates are longitude/latitude
+split1 <- cv_spatial(x = sf::st_as_sf(modelingDF, coords = c("x", "y"), crs = 4326),
+                     column = "presAbs",
+                     k = 5,
+                     size = 500000, # block size in metres (500 km)
+                     selection = "random",
+                     iteration = 50,
+                     seed = 1357,
+                     biomod2 = FALSE,
+                     progress = FALSE)
+# split1$folds_ids holds the fold number of each point, like foldAssgn above
+```
+
+The following line for exploring spatial autocorrelation takes a while to run: it fits a variogram to each of the 20 layers, which took about 13 minutes on a laptop with `num_sample = 5000` (about 6 minutes with 2000), so it is not run when this page is built. Run it yourself if you're curious. Over a whole continent, many of these variables (especially the temperature variables) change along broad gradients and their variograms never level off. The fitted ranges for those layers can therefore be implausibly large (thousands of km), so treat the suggested block size as a rough starting point, not an answer.
+
+```{r}
+#| eval: false
+sac_rangeExplorer <- cv_spatial_autocor(r = envStack,
+                                        num_sample = 5000)
+```
+
+# Turn in
+
+**(a Canvas discussion post, by the due date on Canvas)** Please post to the online discussion of this lab. Please include brief descriptions of your exploration of the exercises. Please also include, if applicable:
+
+* Any key take-aways from this lab that you want to remember for any future projects you may conduct in which you use species distribution models.
+* Any remaining questions or confusions do you have that you might like to learn more about.
+
+# Further Resources
+
+Allouche, O., Tsoar, A., & Kadmon, R. (2006). Assessing the accuracy of species distribution models: Prevalence, kappa and the true skill statistic (TSS). Journal of Applied Ecology, 43(6), 1223-1232.
+
+Bahn, V., & McGill, B. J. (2013). Testing the predictive performance of distribution models. Oikos, 122, 321–331.
+
+Davis, J., & Goadrich, M. (2006). The Relationship Between Precision-Recall and ROC Curves. Proceedings of the 23rd International Conference on Machine Learning -- ICML'06, 233-240.
+
+Fielding, A. H., & Bell, J. F. (1997). A review of methods for the assessment of prediction errors in conservation presence / absence models. Environmental Conservation, 24(1), 38-49.
+
+Hijmans, R. J. (2012). Cross-validation of species distribution models: Removing spatial sorting bias and calibration with a null model. Ecology, 93(3), 679–688.
+
+Liu, C., White, M., & Newell, G. (2011). Measuring and comparing the accuracy of species distribution models with presence-absence data. Ecography, 34(2), 232-243.
+
+Lobo, J. M., Jimenez-Valverde, A., & Real, R. (2008). AUC: A misleading measure of the performance of predictive distribution models. Global Ecology and Biogeography, 17(2), 145-151.
+
+Peterson, A. T., Papes, M., & Soberon, J. (2008). Rethinking receiver operating characteristic analysis applications in ecological niche modeling. Ecological Modelling, 213, 63–72.
+
+Roberts, D. R., et al (2017). Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure. Ecography, 40(8), 913–929.
+
+Santika, T. (2011). Assessing the effect of prevalence on the predictive performance of species distribution models using simulated data. Global Ecology and Biogeography, 20(1), 181-192.
+
+Valavi, R., Elith, J., Lahoz-Monfort, J. J., & Guillera-Arroita, G. (2019). blockCV: An r package for generating spatially or environmentally separated folds for k-fold cross-validation of species distribution models. Methods in Ecology and Evolution, 10(2), 225–232.
+
+Wikipedia links:
+
+* [Classifier evaluation](https://en.wikipedia.org/wiki/Evaluation_of_binary_classifiers)
+* [Cohen's Kappa](https://en.wikipedia.org/wiki/Cohen%27s_kappa)
+* [Mutual information](https://en.wikipedia.org/wiki/Mutual_information)
+* [ROC curves](https://en.wikipedia.org/wiki/Receiver_operating_characteristic)

@@ -1,0 +1,70 @@
+---
+title: "Demos"
+subtitle: "Short worked examples used in class"
+---
+
+These demos go with particular class meetings. Unlike the labs, they have no exercises to turn in. Run them, change things, and bring questions to class. Each comes in R and Python, and all are included in the starter kits.
+
+## A model bake-off with partial dependence plots
+
+::: {.lab-meta}
+[Week 6]{} [Reading: Valavi et al. (2022)]{} [GLM · CART · RF · BRT · Maxent]{}
+:::
+
+A virtual species responds linearly to elevation and has a hump-shaped (quadratic) response to annual precipitation. Seven models are fit to the same presence/absence data: correctly specified and misspecified GLMs, a classification tree, a random forest, boosted regression trees, and Maxent. The random forest, boosted trees, and Maxent are tuned on a validation set, then all models are compared on a separate test set with ROC curves. Two-variable partial dependence plots show what each model actually learned about elevation and precipitation, which we can check against the true surface.
+
+* A partial dependence plot averages a model's predictions over the observed values of the other variables. That shows the learned relationship for any model, including ones without coefficients.
+* A correctly specified model recovers the true shape best. Flexible machine-learning models approximate it, with more noise. A misspecified GLM can miss it entirely.
+* Tune on validation data and judge on separate test data. Small AUC differences between tuning settings are often noise, and it's worth checking argument names: a misspelled `regmult` is silently ignored.
+
+[R version](../r/demo-model-comparison.qmd){.btn .btn-primary}
+[Python version](../python/demo-model-comparison.qmd){.btn .btn-outline-primary}
+[Open in Colab](https://colab.research.google.com/github/Hutchinson-Lab/fw532/blob/main/python/demo-model-comparison.ipynb){.btn .btn-outline-primary}
+
+## Marginal vs. partial effects
+
+::: {.lab-meta}
+[Weeks 4–6]{} [Interpreting fitted models]{} [GLM · RF · BRT]{}
+:::
+
+A virtual species with a quadratic term and an interaction is used to compare two ways of showing one variable's effect. A **marginal** effect holds the other variables at their means. A **partial** effect averages predictions over the observed values of the other variables. Both are computed for the true probability function and for a boosted regression tree, a random forest, and a misspecified GLM, and overlaid. A two-variable partial surface then shows how well the boosted trees recover the true interaction.
+
+* Marginal and partial effects differ whenever the model is nonlinear (even just through the logistic link) or has interactions. Correlated predictors make the choice matter more.
+* Comparing against the known truth separates errors in the model from differences caused by which summary you chose.
+* Effect curves are least reliable where data are sparse. Check the rug of observed values before interpreting the tails.
+
+[R version](../r/demo-effect-plots.qmd){.btn .btn-primary}
+[Python version](../python/demo-effect-plots.qmd){.btn .btn-outline-primary}
+[Open in Colab](https://colab.research.google.com/github/Hutchinson-Lab/fw532/blob/main/python/demo-effect-plots.ipynb){.btn .btn-outline-primary}
+
+## Information leakage
+
+::: {.lab-meta}
+[Week 2]{} [Reading: Roberts et al. (2017)]{} [Evaluation · transferability]{}
+:::
+
+A species responds only to precipitation seasonality, but the model is given a *proxy* instead. The proxy tracks seasonality closely south of 45°N and is pure noise north of it. A logistic regression on the proxy, trained and tested on a random split of southern data, looks good (AUC around 0.85). Applied to new northern data, it is no better than a coin flip. The southern test residuals are strongly spatially autocorrelated (a Moran's I test), the warning sign that random holdouts let information leak between training and test data.
+
+* A random train/test split of spatially clustered data can overstate how well a model will transfer to new places.
+* A proxy correlated with the true driver predicts well wherever the correlation holds, and fails completely where it doesn't.
+* Spatial autocorrelation in residuals is a diagnostic that an evaluation may be too optimistic. Whether blocked cross-validation would catch a contrived case like this one is left as an open question.
+
+[R version](../r/demo-info-leakage.qmd){.btn .btn-primary}
+[Python version](../python/demo-info-leakage.qmd){.btn .btn-outline-primary}
+[Open in Colab](https://colab.research.google.com/github/Hutchinson-Lab/fw532/blob/main/python/demo-info-leakage.ipynb){.btn .btn-outline-primary}
+
+## Sampling from a point process
+
+::: {.lab-meta}
+[Week 6]{} [Reading: Renner et al. (2015)]{} [Inhomogeneous Poisson processes]{}
+:::
+
+This demo turns an abundance surface λ into the intensity of an *inhomogeneous Poisson process* (IPP) and draws random point patterns from it. R uses spatstat's `rpoispp()`; Python draws a Poisson count for each cell and places the points uniformly within it. The number of points in a draw is itself Poisson, with mean equal to the integral of λ over the region. On a raster that's Σ λ × cell area, which the demo computes and checks against repeated draws. A homogeneous sample then plays the role of *background points*, linking to how Maxent and point process models use them.
+
+* An IPP's intensity λ(s) is the expected number of points per unit area, and the total count is Poisson with mean ∫λ.
+* λ only means something once the units of area are fixed: switching between pixels and square degrees changes the expected count 36-fold.
+* A homogeneous process samples the region regardless of the species. That's what background points do: they approximate the integral of λ, and they are not absences.
+
+[R version](../r/demo-point-processes.qmd){.btn .btn-primary}
+[Python version](../python/demo-point-processes.qmd){.btn .btn-outline-primary}
+[Open in Colab](https://colab.research.google.com/github/Hutchinson-Lab/fw532/blob/main/python/demo-point-processes.ipynb){.btn .btn-outline-primary}

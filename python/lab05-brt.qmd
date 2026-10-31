@@ -1,0 +1,465 @@
+---
+title: "Lab 5: Boosted Regression Trees (BRT)"
+subtitle: "FW 532 · Python version"
+---
+
+**Goals:**
+
+* To understand how boosted regression tree models are built and interpreted in Python.
+
+**You Will Need:**
+
+* The course environmental raster stack (`data/envStack.tif`, included in the starter kit)
+* Python packages: numpy, pandas, matplotlib, scikit-learn, rasterio (see `requirements.txt`)
+* The course helper module `sdmlab.py` (in the same folder as this notebook)
+* The BRT tutorial by Elith & Leathwick, [Boosted regression trees for ecological
+  modeling](https://rspatial.org/raster/sdm/9_sdm_brt.html), for its explanations (its code is in R)
+
+Run the cells in order from top to bottom.
+
+```{python}
+# Running on Google Colab? This cell downloads the course files. (Anywhere else it does nothing.)
+import os, sys
+if "google.colab" in sys.modules:
+    if not os.path.exists("/content/fw532"):
+        !git clone -q --depth 1 https://github.com/Hutchinson-Lab/fw532.git /content/fw532
+        %pip install -q rasterio
+    os.chdir("/content/fw532/python")
+```
+
+# Setup
+
+The R version of this lab works through the tutorial above, which uses `gbm.step()` and other
+helper functions from R's dismo package. Python has no copy of those helpers, so this notebook
+builds the same steps with scikit-learn's `GradientBoostingClassifier`, which fits the same kind of
+model: a sum of many small regression trees, each fit to the gradient of the binomial deviance.
+Read the tutorial for its explanations and rationale, and use the code here to apply them to our data.
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.inspection import PartialDependenceDisplay
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+
+import sdmlab as sdm   # course helpers for rasters
+
+env_stack = sdm.load_env()
+```
+
+# Simulate Data
+
+This is the same data simulation as last lab, with a nonlinear function of the environmental
+variables. Feel free to experiment as well with the original linear version (commented out here) or
+a function of your own choosing.
+
+One difference from last lab: here we sample points wherever the climate data exist and keep
+*all* the layers at those points, even if some values are missing (`NaN`). A few cells near the coast
+have climate data but no elevation. R's gbm handles missing predictor values, so the R version keeps
+such points. (We deal with them in Python below.)
+
+```{python}
+# define logistic function
+def logistic(x):
+    return np.exp(x) / (1 + np.exp(x))
+
+# get points
+n_points = 1000
+# sample points where climate data exists (basically in North America, not oceans);
+# layer="Isothermality" means other layers (e.g. elevation) may be NaN at these points
+sim_pts = env_stack.sample_random(n_points, seed=1234, layer="Isothermality")
+print("points with at least one missing value:", sim_pts.isna().any(axis=1).sum())
+
+# set parameters
+# intercept = -1.5
+# beta1 = -2
+# beta2 = -1.5
+# beta3 = 1.5
+# p_occ = logistic(intercept
+#                  + beta1 * sdm.scale(env_stack["Precipitation.Seasonality"])
+#                  + beta2 * sdm.scale(env_stack["Min.Temperature.of.Coldest.Month"])
+#                  + beta3 * sdm.scale(env_stack["Mean.Temperature.of.Wettest.Quarter"]))
+
+intercept = -0.25
+beta1 = -1
+beta2 = 1
+beta3 = 1.5
+beta4 = 1
+beta5 = -1
+p_occ = logistic(intercept
+                 + beta1 * sdm.scale(env_stack["Mean.Diurnal.Range"])
+                 + beta2 * sdm.scale(env_stack["Isothermality"])
+                 + beta3 * sdm.scale(env_stack["Mean.Temperature.of.Wettest.Quarter"])
+                 + beta4 * sdm.scale(env_stack["Mean.Diurnal.Range"])**2   # quadratic term
+                 + beta5 * sdm.scale(env_stack["Isothermality"])
+                         * sdm.scale(env_stack["Mean.Temperature.of.Wettest.Quarter"]))  # interaction term
+
+# get the values that correspond to the points we selected:
+p_occs = sdm.extract(p_occ, env_stack, sim_pts["x"], sim_pts["y"])
+
+# sample from these probabilities (a *different* seed than above; see Lab 1):
+rng = np.random.default_rng(5678)
+pres_abs = rng.binomial(n=1, p=p_occs)
+
+# put response and variables together in a DataFrame:
+modeling_df = sim_pts.copy()
+modeling_df.insert(0, "presAbs", pres_abs)
+
+# plot the result
+ax = sdm.plot_map(p_occ, env_stack, title="Probability of occurrence")
+for value, color, label in [(0, "blue", "absence"), (1, "red", "presence")]:
+    rows = modeling_df["presAbs"] == value
+    ax.scatter(modeling_df.loc[rows, "x"], modeling_df.loc[rows, "y"], s=4, color=color, label=label)
+ax.legend(loc="lower left");
+```
+
+```{python}
+# split into training and test
+train_data = modeling_df.iloc[:n_points // 2]
+test_data = modeling_df.iloc[n_points // 2:]
+```
+
+(`sample_random()` returns the points in random order, so taking the first half for training and
+the second half for testing is a random split. The coordinates of each point are in the `x` and `y`
+columns.)
+
+**Missing values.** scikit-learn's `GradientBoostingClassifier` refuses to fit or predict when a
+predictor is `NaN`, so we keep only the complete rows. (R's gbm sends missing values down a separate
+branch of each tree instead. In scikit-learn, `HistGradientBoostingClassifier` handles `NaN`
+natively, but it has no bag fraction, so we use the classic version here.) Whether any incomplete
+points were drawn depends on the random sample, so the counts below may be zero.
+
+```{python}
+pred_vars = env_stack.names   # all 20 layers are candidate predictors
+
+train_complete = train_data.dropna(subset=pred_vars)
+test_complete = test_data.dropna(subset=pred_vars)
+print("training rows dropped:", len(train_data) - len(train_complete))
+print("test rows dropped:", len(test_data) - len(test_complete))
+
+X_train, y_train = train_complete[pred_vars], train_complete["presAbs"]
+X_test, y_test = test_complete[pred_vars], test_complete["presAbs"]
+```
+
+From here, dive into the tutorial. Make sure you consider THIS data as you go through. For instance,
+if the tutorial tunes a parameter with some rationale for their data, use the rationale and not their
+final value to set the parameter in your analysis.
+
+# Getting started: the tutorial's main steps on our data
+
+> **A starting point, not tuned answers.** This section runs the tutorial's main steps once on our
+> simulated data, so you have working code to build on. It uses the tutorial's *first* settings
+> (tree complexity 5, learning rate 0.01, bag fraction 0.5). These are **not** tuned for our data. As
+> you read the tutorial, revisit each choice using its rationale, and refit.
+
+**How the gbm settings map to scikit-learn:**
+
+| gbm / `gbm.step()` | `GradientBoostingClassifier` | meaning |
+|---|---|---|
+| `learning.rate` (lr) | `learning_rate` | shrinks each tree's contribution |
+| `bag.fraction` | `subsample` | fraction of the data (drawn without replacement) used to fit each tree |
+| `tree.complexity` (tc) | `max_leaf_nodes = tc + 1` | gbm's `interaction.depth` is the number of *splits* per tree; a tree with tc splits has tc + 1 leaves |
+| `n.trees` | `n_estimators` | number of trees |
+| `n.minobsinnode = 10` (default) | `min_samples_leaf = 10` | smallest allowed leaf |
+
+We also set `max_depth=None` so that, as in gbm, tree size is limited only by the number of leaves.
+(scikit-learn's default `max_depth=3` would otherwise cap it.)
+
+## Fit a model with cross-validation (a `gbm_step()` function)
+
+`gbm.step()` in R uses 10-fold cross-validation to estimate the predictive deviance as trees are
+added, picks the number of trees where that deviance is lowest, and then refits the model to all the
+training data with that many trees. The function below does the same. It fits each fold's model with
+`max_trees` trees, then uses `staged_predict_proba()`, which returns the predictions after 1 tree,
+2 trees, 3 trees, ..., so one fit per fold gives the whole deviance curve.
+
+The **deviance** here is the same measure gbm reports: −2 × the mean binomial log-likelihood
+(i.e., twice scikit-learn's `log_loss`). Lower is better.
+
+```{python}
+def mean_deviance(y, p):
+    """Mean binomial deviance, as in dismo's calc.deviance(..., calc.mean = TRUE)."""
+    y = np.asarray(y)
+    p = np.clip(p, 1e-12, 1 - 1e-12)   # avoid log(0)
+    return -2 * np.mean(y * np.log(p) + (1 - y) * np.log(1 - p))
+
+
+def gbm_step(X, y, tree_complexity=5, learning_rate=0.01, bag_fraction=0.5,
+             max_trees=1000, n_folds=10, seed=None):
+    """A simplified Python version of dismo's gbm.step().
+
+    1. Split the data into n_folds folds, stratified so each fold has a similar share of presences.
+    2. For each fold, fit a model with max_trees trees to the other folds, and compute the deviance
+       on the held-out fold after each tree.
+    3. Average across folds to get the CV deviance as a function of the number of trees.
+    4. Pick the number of trees with the lowest mean CV deviance, and refit to ALL the data.
+    """
+    def new_model(n_trees, random_state):
+        return GradientBoostingClassifier(learning_rate=learning_rate,
+                                          subsample=bag_fraction,
+                                          max_leaf_nodes=tree_complexity + 1,
+                                          max_depth=None,
+                                          min_samples_leaf=10,
+                                          n_estimators=n_trees,
+                                          random_state=random_state)
+
+    folds = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    cv_dev = np.zeros((n_folds, max_trees))   # rows = folds, columns = number of trees
+    cv_pred = np.zeros((len(y), max_trees))   # held-out predictions for every point, after each tree
+    fold_id = np.zeros(len(y), dtype=int)
+    for k, (fit_rows, hold_rows) in enumerate(folds.split(X, y)):
+        model = new_model(max_trees, seed).fit(X.iloc[fit_rows], y.iloc[fit_rows])
+        # staged_predict_proba gives predictions after 1, 2, ..., max_trees trees
+        for i, p in enumerate(model.staged_predict_proba(X.iloc[hold_rows])):
+            cv_pred[hold_rows, i] = p[:, 1]
+            cv_dev[k, i] = mean_deviance(y.iloc[hold_rows], p[:, 1])
+        fold_id[hold_rows] = k
+
+    mean_dev = cv_dev.mean(axis=0)
+    se_dev = cv_dev.std(axis=0, ddof=1) / np.sqrt(n_folds)
+    best_trees = int(np.argmin(mean_dev)) + 1    # +1 because Python counts from 0
+    if best_trees == max_trees:
+        print("Warning: the minimum is at max_trees; increase max_trees.")
+
+    # CV AUC at the best number of trees (mean and standard error across folds), like gbm.step
+    fold_auc = [roc_auc_score(y[fold_id == k], cv_pred[fold_id == k, best_trees - 1])
+                for k in range(n_folds)]
+
+    final_model = new_model(best_trees, seed).fit(X, y)
+    final_model.cv = {"best_trees": best_trees, "mean_dev": mean_dev, "se_dev": se_dev,
+                      "deviance_mean": mean_dev[best_trees - 1],
+                      "deviance_se": se_dev[best_trees - 1],
+                      "auc_mean": np.mean(fold_auc),
+                      "auc_se": np.std(fold_auc, ddof=1) / np.sqrt(n_folds)}
+    return final_model
+```
+
+Fitting takes about a minute (10 folds × 1000 trees). The folds and the bag fraction (each tree is fit
+to a random half of the data) are random, so we give a seed.
+
+```{python}
+brt1 = gbm_step(X_train, y_train, tree_complexity=5, learning_rate=0.01, bag_fraction=0.5,
+                max_trees=1000, seed=2468)
+
+cv = brt1.cv
+trees = np.arange(1, len(cv["mean_dev"]) + 1)
+fig, ax = plt.subplots(figsize=(6, 4))
+ax.plot(trees, cv["mean_dev"], color="black")
+ax.plot(trees, cv["mean_dev"] + cv["se_dev"], color="black", linestyle=":")
+ax.plot(trees, cv["mean_dev"] - cv["se_dev"], color="black", linestyle=":")
+ax.axhline(cv["deviance_mean"], color="red")
+ax.axvline(cv["best_trees"], color="green")
+ax.set_xlabel("number of trees")
+ax.set_ylabel("CV deviance");
+```
+
+The plot shows the mean cross-validated deviance (solid curve, with dotted curves one standard error
+above and below) as trees are added. The red line marks the minimum of the mean, and the green line
+the number of trees at which it occurs. (`gbm.step()` adds trees in steps of 50 and stops once the
+curve turns up; here we always fit `max_trees` and look at the whole curve.)
+
+> **Question:** How many trees were chosen with these settings (printed below)? What does the
+> tutorial's rule of thumb say about this, and what would you change?
+
+## Inspect the model
+
+Cross-validated statistics, estimated on the held-out folds:
+
+```{python}
+print("best number of trees:", cv["best_trees"])
+print(f"CV deviance: {cv['deviance_mean']:.3f}  (se {cv['deviance_se']:.3f})")
+print(f"CV AUC:      {cv['auc_mean']:.3f}  (se {cv['auc_se']:.3f})")
+```
+
+The relative influence of each variable is based on how often the variable is used for splitting,
+weighted by how much each of those splits improves the model, averaged over all the trees.
+scikit-learn calls this `feature_importances_` and scales it to sum to 1; we multiply by 100 to match
+gbm's scale. (The two are computed in a very similar way, but not identically.)
+
+```{python}
+rel_inf = pd.Series(brt1.feature_importances_ * 100, index=pred_vars).sort_values()
+
+fig, ax = plt.subplots(figsize=(7, 6))
+ax.barh(rel_inf.index, rel_inf.values)
+ax.tick_params(axis="y", labelsize=8)
+ax.set_xlabel("Relative influence");
+```
+
+```{python}
+rel_inf.sort_values(ascending=False).round(2)
+```
+
+> **Question:** We know which variables we used to simulate the species. Did the model find them?
+
+## Plot the fitted functions
+
+Partial dependence plots show the effect of each variable after averaging over the others, here for
+the 12 most influential variables. As in `gbm.plot()`, the y-axis is on the logit (log-odds) scale;
+focus on the shapes. The tick marks along the bottom show the deciles of the data.
+
+```{python}
+top12 = list(rel_inf.sort_values(ascending=False).index[:12])
+
+fig, ax = plt.subplots(figsize=(11, 12))
+PartialDependenceDisplay.from_estimator(brt1, X_train, top12, ax=ax, n_cols=3)
+for a in fig.axes:
+    a.xaxis.label.set_fontsize(8)
+fig.tight_layout();
+```
+
+Like `gbm.plot.fits()`, we can also plot the fitted values (the model's predicted probability at
+each training point) against each predictor, here for the six most influential:
+
+```{python}
+fitted = brt1.predict_proba(X_train)[:, 1]
+
+fig, axes = plt.subplots(2, 3, figsize=(11, 6), constrained_layout=True)
+for ax, var in zip(axes.flat, top12[:6]):
+    ax.scatter(X_train[var], fitted, s=5)
+    ax.set_xlabel(var, fontsize=8)
+    ax.set_ylabel("fitted value")
+    ax.set_ylim(0, 1)
+```
+
+## Interactions
+
+dismo's `gbm.interactions()` measures how strongly each pair of variables interacts in the fitted
+model. For each pair, it predicts (on the logit scale) over a 20 × 20 grid of the two variables, with
+all other variables at their means. If the model had no interaction between the pair, those
+predictions would be *additive*: each cell = a row effect + a column effect. The function below fits
+that additive model (by subtracting row and column means, which is what a two-way linear model with
+factors does on a full grid) and reports the mean squared residual × 1000, as gbm.interactions does.
+
+(A `for` loop over `range(len(pred_vars))` visits every variable by its position; the inner loop starts
+at `i + 1` so each pair is visited once.)
+
+```{python}
+def gbm_interactions(model, X, n_grid=20):
+    """Pairwise interaction strength, following dismo's gbm.interactions()."""
+    means = X.mean()
+    results = []
+    for i in range(len(pred_vars)):
+        for j in range(i + 1, len(pred_vars)):
+            v1, v2 = pred_vars[i], pred_vars[j]
+            g1 = np.linspace(X[v1].min(), X[v1].max(), n_grid)
+            g2 = np.linspace(X[v2].min(), X[v2].max(), n_grid)
+            grid = pd.DataFrame(np.tile(means.values, (n_grid * n_grid, 1)), columns=pred_vars)  # every row = the means
+            grid[v1] = np.repeat(g1, n_grid)                  # vary v1 down the rows ...
+            grid[v2] = np.tile(g2, n_grid)                    # ... and v2 within each block
+            z = model.decision_function(grid[pred_vars]).reshape(n_grid, n_grid)  # logit scale
+            # residuals from the additive fit: subtract row and column means, add back the grand mean
+            resid = z - z.mean(axis=1, keepdims=True) - z.mean(axis=0, keepdims=True) + z.mean()
+            results.append({"var1": v1, "var2": v2, "int_size": 1000 * np.mean(resid**2)})
+    return pd.DataFrame(results).sort_values("int_size", ascending=False).reset_index(drop=True)
+
+find_int = gbm_interactions(brt1, X_train)
+find_int.head(6).round(2)
+```
+
+Here is the fitted surface for the strongest pair. Like `gbm.perspec()`, it holds all the other
+variables at their means and shows the predicted probability. (scikit-learn's own
+`partial_dependence()` function averages over the data instead of fixing the others at their means;
+the shapes are usually similar.)
+
+```{python}
+v1, v2 = find_int.loc[0, "var1"], find_int.loc[0, "var2"]
+g1 = np.linspace(X_train[v1].min(), X_train[v1].max(), 50)
+g2 = np.linspace(X_train[v2].min(), X_train[v2].max(), 50)
+xx, yy = np.meshgrid(g1, g2)
+
+grid = pd.DataFrame(np.tile(X_train.mean().values, (xx.size, 1)), columns=pred_vars)  # every row = the means
+grid[v1] = xx.ravel()
+grid[v2] = yy.ravel()
+zz = brt1.predict_proba(grid[pred_vars])[:, 1].reshape(xx.shape)
+
+fig = plt.figure(figsize=(7, 6))
+ax = fig.add_subplot(projection="3d")
+ax.plot_surface(xx, yy, zz, cmap="viridis")
+ax.set_xlabel(v1, fontsize=8)
+ax.set_ylabel(v2, fontsize=8)
+ax.set_zlabel("fitted value")
+ax.set_zlim(0, 1)
+ax.view_init(elev=30, azim=-125);
+```
+
+> **Question:** Our simulated species has an interaction between Isothermality and
+> Mean.Temperature.of.Wettest.Quarter. Is that the pair the model ranks highest? Why might it not be?
+
+## Predict to the test set and to the map
+
+The final model already contains exactly the chosen number of trees, so `predict_proba()` uses all of
+them. We measure predictive performance with the mean deviance (as the tutorial does) and the AUC.
+
+```{python}
+pred_test = brt1.predict_proba(X_test)[:, 1]
+print(f"test deviance: {mean_deviance(y_test, pred_test):.3f}  (lower is better)")
+print(f"test AUC:      {roc_auc_score(y_test, pred_test):.3f}")
+```
+
+To predict the map, we predict for every land cell (`to_frame()` keeps only cells with values in
+all layers, like `na.rm = TRUE` in R) and put the predictions back on the grid:
+
+```{python}
+grid_cells = env_stack.to_frame()   # one row per land cell
+pred_map = env_stack.to_map(brt1.predict_proba(grid_cells[pred_vars])[:, 1], index=grid_cells.index)
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 3.8), constrained_layout=True)
+sdm.plot_map(p_occ, env_stack, ax=axes[0], title="Truth", vmin=0, vmax=1)
+sdm.plot_map(pred_map, env_stack, ax=axes[1], title="BRT prediction", vmin=0, vmax=1);
+```
+
+## Simplifying the model
+
+The tutorial also shows `gbm.simplify()`, which uses cross-validation to test whether dropping the
+least important variables hurts predictive performance. There is no Python version, but you could
+build one from `gbm_step()`: drop the least influential variable, refit, compare CV deviance, repeat.
+It is slow, because it refits the model many times.
+
+# Exercises
+
+> **Exercise 1:** After completing the tutorial, choose some aspect of BRTs that you are curious about
+> and explore it further. Report on your motivation, design of your analysis, results, and
+> conclusions.
+
+> **Exercise 2:** We used the same simulated species for BRTs as for RFs. Your task is to compare these
+> models. You will need to consider how to tune parameters for a "peak-to-peak" comparison (i.e., you
+> want your best BRT model vs. your best RF model rather than one of them being badly tuned). Please
+> compare predictive performance on the test set (which you will need to decide how to measure) and
+> interpretation of the models (variable importances/plots, predictive rasters, etc.). Report back on
+> how you approached these tasks and what you found!
+>
+> (This lab samples its points a little differently from Lab 4, so fit both models to *this* lab's
+> training and test data.)
+
+# Turn in
+
+**(on Canvas, by the due date on Canvas)** Please post to the online discussion of this lab. Please
+include brief descriptions of your exploration of the exercise, with any relevant plots. Please also
+include, if applicable:
+
+* Any key take-aways from this lab that you want to remember for any future projects you may conduct
+  in which you use species distribution models.
+* Any remaining questions or confusions do you have that you might like to learn more about.
+
+# Further Resources
+
+Elith, J., Leathwick, J. R., & Hastie, T. (2008). A working guide to boosted regression trees.
+*Journal of Animal Ecology*, 77(4), 802-813. <https://doi.org/10.1111/j.1365-2656.2008.01390.x>
+
+Supplementary material from Elith et al. (2008): Appendix S3 (the original tutorial, R code, and
+data), in the article's Supporting Information at <https://doi.org/10.1111/j.1365-2656.2008.01390.x>.
+
+[gbm vignette](https://cran.r-project.org/web/packages/gbm/vignettes/gbm.html): Ridgeway, G.
+Generalized Boosted Models: A guide to the gbm package.
+
+scikit-learn user guide, [Gradient boosting](https://scikit-learn.org/stable/modules/ensemble.html#gradient-boosting).
+
+Technical statistical foundations:
+
+Friedman, J. (2001). Greedy function approximation: a gradient boosting machine. *Annals of
+Statistics*, 29(5), 1189-1232. <https://doi.org/10.1214/aos/1013203451>
+
+Friedman, J. (2002). Stochastic gradient boosting. *Computational Statistics & Data Analysis*, 38(4),
+367-378. <https://doi.org/10.1016/S0167-9473(01)00065-2>
