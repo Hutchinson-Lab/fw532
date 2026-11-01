@@ -1,10 +1,18 @@
 ---
-title: "Demo: Sampling from a Point Process"
+title: "Demo: Point Process Models"
 subtitle: "FW 532 · Python version"
 ---
 
-You Will Need: numpy, matplotlib, rasterio, and the course helper module `sdmlab.py` (in the same
-folder as this notebook). Run the cells in order from top to bottom.
+This demo has four parts. First we *simulate* presence points from an inhomogeneous Poisson process
+(IPP). Then we go the other way, as in an SDM: we *fit* a point process model to one simulated
+pattern, using downweighted Poisson regression. Next we ask how many background (quadrature) points
+are enough. The second and third parts follow the supplementary material of Renner et al. (2015,
+Appendix S1, Section 5), and connect to Figure 1 of Valavi et al. (2022). Finally, we use the same
+trick to fit flexible models (boosted regression trees and Maxent) as point process models, and
+compare them with a linear GLM on a species with strongly nonlinear responses.
+
+You Will Need: numpy, pandas, matplotlib, statsmodels, scikit-learn, elapid, rasterio, and the course helper module
+`sdmlab.py` (in the same folder as this notebook). Run the cells in order from top to bottom.
 
 ```{python}
 # Running on Google Colab? This cell downloads the course files. (Anywhere else it does nothing.)
@@ -12,7 +20,7 @@ import os, sys
 if "google.colab" in sys.modules:
     if not os.path.exists("/content/fw532"):
         !git clone -q --depth 1 https://github.com/Hutchinson-Lab/fw532.git /content/fw532
-        %pip install -q rasterio
+        %pip install -q rasterio elapid
     os.chdir("/content/fw532/python")
 ```
 
@@ -26,6 +34,7 @@ equivalent, so we write the sampler ourselves below; it takes only a few lines.)
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import statsmodels.api as sm
 
 import sdmlab as sdm   # course helpers for rasters
 
@@ -178,3 +187,542 @@ print("land area:", round(land_area), "square degrees;  expected points:", round
 For a constant intensity, the integral is just the constant times the area of the region. In Maxent
 (Lab 6), background points play this role: a sample of the available environments that is used to
 approximate the integral of λ over the region (Renner et al. 2015).
+
+# Fitting a point process model to presence-only data
+
+So far we have simulated *from* a point process. An SDM goes the other way: given presence-only
+records, estimate the intensity. Let's treat one simulated pattern as our presence records. Because
+we know the true λ, we can check the estimates.
+
+```{python}
+rng = np.random.default_rng(2468)
+pres_pts = sample_ipp(lambda_map / scale_factor, env_stack, rng)   # our "presence-only records"
+len(pres_pts)
+```
+
+Taking logs of λ (divided by `scale_factor`) gives the true model, a log-linear function of the
+covariates:
+
+$$
+\ln \lambda(s) = \beta_0 + \beta_1\,\text{MDR} + \beta_2\,\text{Iso} + \beta_3\,\text{MTWQ} + \beta_4\,\text{MDR}^2 + \beta_5\,\text{Iso} \times \text{MTWQ},
+$$
+
+with intercept $\beta_0$ = `intercept` − log(`scale_factor`). We'll fit a model of exactly this
+form, so any differences from the truth come from estimation, not misspecification.
+
+```{python}
+true_coefs = pd.Series([intercept - np.log(scale_factor), beta1, beta2, beta3, beta4, beta5],
+                       index=["const", "mdr", "iso", "mtwq", "mdr^2", "iso:mtwq"])
+
+def design_matrix(df):
+    """Columns of the model: intercept, the three covariates, the quadratic and the interaction."""
+    X = df[["mdr", "iso", "mtwq"]].copy()
+    X["mdr^2"] = df["mdr"] ** 2
+    X["iso:mtwq"] = df["iso"] * df["mtwq"]
+    return sm.add_constant(X)
+```
+
+The log-likelihood of an IPP with presence points $s_1, \dots, s_m$ in a region $A$ is
+
+$$
+\ell(\beta) = \sum_{i=1}^{m} \ln \lambda(s_i) \;-\; \int_A \lambda(s)\,ds .
+$$
+
+The integral has no closed form, so it is approximated by *quadrature*: evaluate λ at a set of
+quadrature points and add up the values with weights (areas). Quadrature points are what SDM software
+calls **background points**. Seen this way, background points are not pseudo-absences. They are a
+device for estimating the integral, so the question to ask about them is how many are needed to
+estimate it accurately (Renner et al. 2015). We'll come back to that question below. (In R, the
+spatstat function `ppm()` fits these models directly; the R version of this demo compares it with the
+approach below.)
+
+## Downweighted Poisson regression (DWPR)
+
+Berman & Turner (1992) showed that the quadrature approximation turns the IPP log-likelihood into a
+weighted Poisson regression, so any GLM software can fit it. Renner et al. (2015, Appendix S1,
+Section 5.2) gave a simple recipe, *downweighted Poisson regression*. Take the $m$ presence points and
+$n$ quadrature points drawn at random from the region. Then:
+
+* give each **quadrature point** weight $w = |A|/n$ (its share of the region's area) and response $z = 0$;
+* give each **presence point** a tiny weight $w = \epsilon$ and response $z = 1/\epsilon$;
+* fit a Poisson GLM of $z$ with these weights.
+
+The weighted Poisson log-likelihood, $\sum_k w_k (z_k \ln \mu_k - \mu_k)$, is then
+
+$$
+\sum_{i=1}^{m} \ln \lambda(s_i) \;-\; \frac{|A|}{n}\sum_{j=1}^{n} \lambda(q_j) \;-\; \underbrace{\epsilon \sum_{i=1}^{m} \lambda(s_i)}_{\approx\, 0},
+$$
+
+which is the IPP log-likelihood, with the integral estimated as |A| × (average of λ over the
+quadrature points). In statsmodels the weights go in `var_weights=`, which plays the role of the
+`weights=` argument of R's `glm()`.
+
+The quadrature points are drawn from the region's grid cells, so first we make a table of every cell
+and its covariate values:
+
+```{python}
+row, col = np.nonzero(~np.isnan(lambda_map))                 # every cell in the region
+all_cells = pd.DataFrame({"mdr": mdr[row, col], "iso": iso[row, col], "mtwq": mtwq[row, col]})
+region_area = len(all_cells) * cell_area                     # |A|, in square degrees
+
+pres_covs = pd.DataFrame({name: sdm.extract(m, env_stack, pres_pts["x"], pres_pts["y"])
+                          for name, m in [("mdr", mdr), ("iso", iso), ("mtwq", mtwq)]})
+
+def dwpr_data(quad_pts, pres_df=None, eps=1e-6):
+    """Presences + quadrature points, with DWPR weights (wt) and response (z)."""
+    if pres_df is None:
+        pres_df = pres_covs       # covariates at the presences of our first species
+    dat = pd.concat([pres_df.assign(pres=1), quad_pts[["mdr", "iso", "mtwq"]].assign(pres=0)],
+                    ignore_index=True)
+    dat["wt"] = np.where(dat["pres"] == 1, eps, region_area / len(quad_pts))   # quadrature weights
+    dat["z"] = dat["pres"] / dat["wt"]                                         # 1/eps at presences, 0 elsewhere
+    return dat
+
+def fit_dwpr(quad_pts, eps=1e-6):
+    """Fit an IPP by downweighted Poisson regression (Renner et al. 2015, Appendix S1, Section 5.2)."""
+    dat = dwpr_data(quad_pts, eps=eps)
+    wt, z = dat["wt"].to_numpy(), dat["z"].to_numpy()
+    fit = sm.GLM(z, design_matrix(dat), family=sm.families.Poisson(), var_weights=wt).fit()
+    mu = fit.fittedvalues.to_numpy()
+    return {"fit": fit,
+            "loglik": np.sum(wt * (z * np.log(mu) - mu)),             # the IPP log-likelihood
+            "quad_intensity": mu[dat["pres"].to_numpy() == 0]}        # fitted intensity at quadrature points
+```
+
+Let's fit it with 10,000 random quadrature points, Maxent's default number of background points:
+
+```{python}
+rng = np.random.default_rng(1357)
+quad_10k = all_cells.iloc[rng.choice(len(all_cells), size=10000, replace=False)]
+dwpr_10k = fit_dwpr(quad_10k)
+pd.DataFrame({"truth": true_coefs, "DWPR": dwpr_10k["fit"].params,
+              "SE": dwpr_10k["fit"].bse}).round(3)
+```
+
+The estimates land close to the true coefficients, mostly within about two standard errors. Unlike
+presence–background logistic regression, DWPR estimates the intercept on the scale of the intensity
+(points per square degree), so its fitted values are a proper intensity map:
+
+```{python}
+pred = dwpr_10k["fit"].predict(design_matrix(all_cells))
+pred_map = np.full(lambda_map.shape, np.nan)
+pred_map[row, col] = pred                                    # put the predictions back on the grid
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 3.8), constrained_layout=True)
+vmax = np.nanmax(pred_map)
+sdm.plot_map(lambda_map / scale_factor, env_stack, ax=axes[0], title="True intensity", vmin=0, vmax=vmax)
+sdm.plot_map(pred_map, env_stack, ax=axes[1], title="DWPR estimate", vmin=0, vmax=vmax);
+```
+
+> **The link to logistic regression and Maxent (IWLR).** Fithian & Hastie (2013) showed that a
+> logistic regression of presences against background points, with a huge weight $W$ on the
+> background points, recovers the same slopes. This is *infinitely weighted logistic regression*
+> (IWLR). It is how `elapid` and R's `maxnet` fit Maxent, with $W = 100$ (Lab 6). The intercept,
+> though, is arbitrary: it is shifted by log(W·n/|A|). That's why Maxent's raw output is only
+> *proportional* to the intensity (Appendix S1, Section 5.1).
+
+```{python}
+dat = pd.concat([pres_covs.assign(pres=1), quad_10k.assign(pres=0)], ignore_index=True)
+w_iwlr = (1e6) ** (1 - dat["pres"])        # W = 10^6 on background points, 1 on presences
+fit_iwlr = sm.GLM(dat["pres"], design_matrix(dat), family=sm.families.Binomial(),
+                  var_weights=w_iwlr).fit()
+print(pd.DataFrame({"IWLR": fit_iwlr.params, "DWPR": dwpr_10k["fit"].params}).round(3))
+print("intercept gap:", round(dwpr_10k["fit"].params["const"] - fit_iwlr.params["const"], 4),
+      "   log(W n / |A|):", round(np.log(1e6 * len(quad_10k) / region_area), 4))
+```
+
+# Are there enough background points?
+
+Every number above depends on the integral being estimated well. With too few quadrature points, the
+log-likelihood (and so the coefficients, standard errors, and model comparisons) carry extra error
+that has nothing to do with the species. Renner et al. (2015) suggest two ways to check.
+
+## Check 1: does the log-likelihood settle down?
+
+Refit the model with more and more random quadrature points and see where the maximized
+log-likelihood stops changing (Appendix S1, Section 5.3; Renner et al. 2015, Fig. 2b). Because the
+points are random, we repeat each size several times to see how much the answer varies from one set
+of quadrature points to another.
+
+We also have a reference value. Our covariates are constant within each grid cell, so using *every*
+cell as a quadrature point (weight = one cell's area) computes the integral exactly at the resolution
+of our data.
+
+```{python}
+dwpr_all = fit_dwpr(all_cells)   # every cell: the exact integral at this resolution
+
+n_quad = [500, 1000, 2000, 5000, 10000, 20000, 50000]
+n_reps = 20
+rng = np.random.default_rng(8642)
+log_liks = np.array([[fit_dwpr(all_cells.iloc[rng.choice(len(all_cells), size=n, replace=False)])["loglik"]
+                      for n in n_quad]
+                     for rep in range(n_reps)])     # n_reps rows x len(n_quad) columns
+
+fig, ax = plt.subplots(figsize=(8, 4.5))
+for j, n in enumerate(n_quad):
+    ax.scatter(np.full(n_reps, n), log_liks[:, j], s=15, color="black", alpha=0.4)
+ax.axhline(dwpr_all["loglik"], color="red", linestyle="--", label="all cells (exact)")
+ax.set_xscale("log")
+ax.set_xticks(n_quad, [f"{n:,}" for n in n_quad])   # label the sizes we used
+ax.minorticks_off()
+ax.set_xlabel("Number of random quadrature points (log scale)")
+ax.set_ylabel("Maximized log-likelihood")
+ax.set_title(f"{n_reps} random sets of quadrature points at each size")
+ax.legend();
+```
+
+With a few hundred quadrature points, the log-likelihood can be off by tens of units, depending only
+on which points were drawn. The spread narrows as $n$ grows.
+
+This is the same check as Figure 1 of Valavi et al. (2022), the model benchmark we read in Week 6.
+Before choosing the number of background points for their study, they refitted MaxEnt with 100 to
+100,000 random background points, repeating each size 10 times. They compared the results with a
+"gold standard" model that used every cell in the landscape as background, just like our all-cells
+reference line. Their yardstick was predictive performance (test AUC) rather than the log-likelihood;
+Renner et al. (2015) suggest either. Valavi et al. chose 50,000 background points, the size at which
+the replicates came close to the gold standard.
+
+## Check 2: the standard error of the integral
+
+Renner et al. (2015, p. 370) point out that this spread can be predicted with a familiar formula.
+With $n$ random quadrature points, the integral is estimated as |A| times the *average* fitted
+intensity at those points. That's a sample mean, so its standard error is the usual one:
+
+$$
+\text{SE}(n) = \frac{|A|\, s}{\sqrt{n}},
+$$
+
+where $s$ is the standard deviation of the fitted intensity across the region, estimated from the
+quadrature points of an initial fit. Turned around, this tells us how many points we need. If we want
+the SE to be at most some tolerance $\tau$ (in log-likelihood units), we need
+
+$$
+n \;\ge\; \left(\frac{|A|\, s}{\tau}\right)^2 .
+$$
+
+Renner et al. used $\tau = 2$. That is a sensible scale: differences of a couple of log-likelihood
+units are what decide model comparisons. For example, a likelihood-ratio test for one extra term at
+the 5% level needs a difference of 1.92.
+
+```{python}
+s = np.std(dwpr_10k["quad_intensity"], ddof=1)    # spread of the fitted intensity, from the 10,000-point fit
+
+def se_loglik(n):
+    return region_area * s / np.sqrt(n)
+
+tolerance = 2
+n_required = int(np.ceil((region_area * s / tolerance) ** 2))
+print("s                    :", round(s, 3))
+print("SE with 10,000 points:", round(se_loglik(10000), 2))
+print("n required (SE <= 2) :", n_required)
+print("cells in the region  :", len(all_cells))
+```
+
+How well does the formula predict the simulation? Compare the standard deviation of the 20
+log-likelihoods at each size with SE(n):
+
+```{python}
+pd.DataFrame({"simulated SD": log_liks.std(axis=0, ddof=1),
+              "formula SE": se_loglik(np.array(n_quad))},
+             index=pd.Index(n_quad, name="n")).round(2)
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(8, 4.5))
+for j, n in enumerate(n_quad):
+    ax.scatter(np.full(n_reps, n), log_liks[:, j], s=15, color="black", alpha=0.4)
+n_grid = np.logspace(np.log10(400), np.log10(60000), 100)
+ax.plot(n_grid, dwpr_all["loglik"] + 2 * se_loglik(n_grid), color="blue", label="± 2 SE from the formula")
+ax.plot(n_grid, dwpr_all["loglik"] - 2 * se_loglik(n_grid), color="blue")
+ax.axhline(dwpr_all["loglik"], color="red", linestyle="--", label="all cells (exact)")
+ax.axvline(n_required, color="blue", linestyle=":", label="n needed for SE ≤ 2")
+ax.set_ylim(log_liks.min() - 5, log_liks.max() + 5)
+ax.set_xscale("log")
+ax.set_xticks(n_quad, [f"{n:,}" for n in n_quad])   # label the sizes we used
+ax.minorticks_off()
+ax.set_xlabel("Number of random quadrature points (log scale)")
+ax.set_ylabel("Maximized log-likelihood")
+ax.set_title("Simulation vs. the standard-error formula")
+ax.legend(loc="lower right");
+```
+
+The formula tracks the simulation reasonably well. (With only 20 replicates, the simulated standard
+deviations are themselves noisy, by roughly ±15%.) So one quick initial fit tells us roughly how many
+background points are needed, without running all the replicates. For this species the rule's answer
+(printed above) is the same order as the 50,000 points that Valavi et al. (2022) settled on by the
+slower, replicate-based route. At the largest sizes the simulated
+spread is a bit *smaller* than the formula predicts. That's because we are sampling without
+replacement from a finite set of cells: with half of all cells in the sample, the SE shrinks by a
+factor of about $\sqrt{1 - n/N}$, and with every cell the integral is exact.
+
+## How much does it matter for the coefficients?
+
+The log-likelihood matters for comparing models. What about the coefficients themselves? Here is how
+much they vary across random sets of quadrature points, next to their usual (model-based) standard
+errors:
+
+```{python}
+rng = np.random.default_rng(9753)
+coef_sd = {"model SE": dwpr_all["fit"].bse}
+for n in [1000, 10000, 50000]:
+    coefs = pd.DataFrame([fit_dwpr(all_cells.iloc[rng.choice(len(all_cells), size=n, replace=False)])["fit"].params
+                          for rep in range(n_reps)])
+    coef_sd[f"quadrature SD, n={n}"] = coefs.std(ddof=1)
+pd.DataFrame(coef_sd).round(3)
+```
+
+With 1,000 quadrature points, the error from quadrature is comparable to the statistical
+uncertainty in the coefficients, and that extra error isn't reflected in the reported standard
+errors. With tens of thousands of points it becomes small by comparison. Renner et al. (2015) make the
+same point: quadrature error can be modest relative to the coefficients' standard errors, but only
+once there are enough points.
+
+> **Questions**
+>
+> * Maxent's default is 10,000 background points. Is that enough for this species, by the τ = 2 rule?
+> * Does the formula for the required number of points depend on how many presences you have? Try
+>   `scale_factor = 5` (about five times as many presences) and rerun: how do $s$ and the required
+>   $n$ change, and why?
+> * Which features of a species' intensity surface would make the integral harder to estimate, so
+>   that more background points are needed?
+
+> **Exercise:** Our quadrature points were *random* cells. Try a regular grid instead: use every
+> k-th row and column of the grid (e.g. `all_cells` restricted to `(row % k == 0) & (col % k == 0)`,
+> with weight |A|/n as before) for k = 2, 4, 8, 16. Compare each log-likelihood with the exact value.
+> Do grids reach it faster than random points do? Renner et al. (2015, Fig. 2a) checked convergence
+> with a grid of decreasing spacing.
+
+# Beyond GLMs: flexible models as point process models
+
+DWPR turns fitting a point process model into fitting a weighted Poisson regression. So any method
+that can fit a Poisson model with observation weights can fit a point process model, not just GLMs.
+Renner et al. (2015) make this point for DWPR, and Fithian & Hastie (2013) make the same point for
+weighted logistic regression. Two flexible methods from this course qualify:
+
+* **Boosted regression trees.** A Poisson BRT can take exactly the same response `z` and weights `wt`
+  as the GLM. The trees learn the shapes of the responses and any interactions from the data, and the
+  model still estimates the intensity on its true scale.
+* **Maxent.** `elapid` (like R's `maxnet`) fits Maxent by infinitely weighted logistic regression (see
+  the IWLR note above). It expands each covariate into many features (linear, quadratic, product,
+  hinge) and uses L1 regularization to keep only the ones that help (Lab 6).
+
+Using point-process weights for BRTs is not the usual practice. In their benchmark, Valavi et al.
+(2022) fitted BRTs as presence-vs-background *classifiers* (Bernoulli loss), with the background
+points down-weighted so that their total weight equals that of the presences. That is the approach
+Renner et al. (2015) call statistically naïve. Valavi et al. used point-process weighting only for
+GLMs and GAMs.
+
+Our first species is a poor test of flexible methods, though. Its true intensity has a quadratic term
+and an interaction, but the GLM we fitted contained *exactly* those terms: it was told the true
+formula. Those effects were also mild. In a real analysis nobody tells you the form. So let's simulate
+a second species whose responses a simple GLM can't represent, and compare three models that are
+*not* told the form: a linear GLM, a Poisson BRT, and Maxent.
+
+## A species with nonlinear responses
+
+Species 2 has a hump-shaped response to mean diurnal range (an optimum near its average), a sharp
+threshold in the temperature of the wettest quarter, and a steady decline with isothermality:
+
+$$
+\ln \lambda_2(s) = \alpha_2 - 0.8\,\text{MDR}^2 + 1.5 \cdot \mathbb{1}[\text{MTWQ} > 0] - 0.5\,\text{Iso},
+$$
+
+where $\mathbb{1}[\cdot]$ is 1 when the condition holds and 0 otherwise. We pick $\alpha_2$ so that
+about 900 points are expected.
+
+```{python}
+def shape2(d):
+    """Species 2's log intensity, minus its intercept: hump + step + linear."""
+    return -0.8 * d["mdr"] ** 2 + 1.5 * (d["mtwq"] > 0) - 0.5 * d["iso"]
+
+alpha2 = np.log(900 / (np.sum(np.exp(shape2(all_cells))) * cell_area))   # gives ~900 expected points
+lambda2_map = np.full(lambda_map.shape, np.nan)
+lambda2_map[row, col] = np.exp(alpha2 + shape2(all_cells))             # the true intensity map
+
+rng = np.random.default_rng(4321)
+pres_pts2 = sample_ipp(lambda2_map, env_stack, rng)   # training "presence records"
+rng = np.random.default_rng(5555)
+test_pts2 = sample_ipp(lambda2_map, env_stack, rng)   # an independent test pattern from the same process
+
+def covariates_at(pts):
+    """The three covariates at a set of points."""
+    return pd.DataFrame({name: sdm.extract(m, env_stack, pts["x"], pts["y"])
+                         for name, m in [("mdr", mdr), ("iso", iso), ("mtwq", mtwq)]})
+
+pres_covs2 = covariates_at(pres_pts2)
+test_covs2 = covariates_at(test_pts2)
+print("training points:", len(pres_covs2), "  test points:", len(test_covs2))
+
+ax = sdm.plot_map(lambda2_map, env_stack, title="True intensity of species 2, with its training points")
+ax.scatter(pres_pts2["x"], pres_pts2["y"], s=2, color="red");
+```
+
+## Fitting the three models
+
+All three models get the same 50,000 random quadrature (background) points. That's the number Valavi
+et al. (2022) chose, and close to what the standard-error rule asked for with species 1. (Checking it
+for species 2 is one of the questions below.)
+
+```{python}
+rng = np.random.default_rng(6666)
+quad2 = all_cells.iloc[rng.choice(len(all_cells), size=50000, replace=False)]
+dat2 = dwpr_data(quad2, pres_df=pres_covs2)   # DWPR response (z) and weights (wt) for species 2
+covs = ["mdr", "iso", "mtwq"]
+```
+
+**A linear GLM** (DWPR), the simplest model you might try without knowing the form:
+
+```{python}
+fit_linear = sm.GLM(dat2["z"], sm.add_constant(dat2[covs]), family=sm.families.Poisson(),
+                    var_weights=dat2["wt"]).fit()
+```
+
+**A Poisson BRT** with the same response and weights. In R this is the gbm package with
+`distribution = "poisson"` and `weights =`. In scikit-learn, `GradientBoostingClassifier` (Lab 5) has
+no Poisson loss, but `HistGradientBoostingRegressor` does (`loss="poisson"`), and it accepts weights
+through `sample_weight=`. It first bins each covariate into at most 255 values, which makes it fast.
+Settings map roughly to gbm's: `learning_rate` is the shrinkage, and `max_leaf_nodes=3` gives
+two-split trees like gbm's `interaction.depth = 2`. Instead of cross-validation, we let it stop adding
+trees when the loss on a held-out 20% of the data stops improving (*early stopping*).
+
+```{python}
+from sklearn.ensemble import HistGradientBoostingRegressor
+
+fit_brt = HistGradientBoostingRegressor(loss="poisson", learning_rate=0.02, max_leaf_nodes=3,
+                                        max_iter=3000, early_stopping=True, validation_fraction=0.2,
+                                        n_iter_no_change=50, random_state=0)
+fit_brt.fit(dat2[covs], dat2["z"], sample_weight=dat2["wt"])
+print("number of trees chosen by early stopping:", fit_brt.n_iter_)
+```
+
+**Maxent** with `elapid`, given the presences and the same quadrature points as background. We use the
+same feature classes as maxnet's defaults (for more than 80 presences) and a regularization multiplier
+of 1. We also ask for 50 hinge features per covariate, as maxnet uses. elapid's default of 10 is
+noticeably less flexible here. `transform="raw"` makes `predict()` return a value proportional to
+exp(linear predictor).
+
+```{python}
+import elapid
+
+fit_maxent = elapid.MaxentModel(feature_types=["linear", "quadratic", "product", "hinge"],
+                                beta_multiplier=1.0, n_hinge_features=50, transform="raw")
+fit_maxent.fit(dat2[covs], dat2["pres"])
+```
+
+Maxent's output is only *proportional* to the intensity, because the IWLR intercept is arbitrary. For
+a Poisson point process, the maximum-likelihood intercept makes the expected number of points,
+$\int_A \lambda(s)\,ds$, equal the number observed. So we rescale Maxent's output to make its
+integral, estimated with the same quadrature points, equal to the number of presences:
+
+```{python}
+maxent_scale = len(pres_covs2) / (region_area * fit_maxent.predict(quad2[covs]).mean())
+
+def maxent_intensity(d):
+    return maxent_scale * fit_maxent.predict(d[covs])
+```
+
+## Comparing the models
+
+First, the test log-likelihood of each model on the independent test pattern (with the integral
+computed exactly over every cell), with the truth and a constant intensity for reference:
+
+```{python}
+def test_loglik(intensity, test_covs):
+    """IPP log-likelihood of the test points, for a function that returns the fitted intensity."""
+    return np.sum(np.log(intensity(test_covs))) - np.sum(intensity(all_cells)) * cell_area
+
+pd.Series({
+    "truth":      test_loglik(lambda d: np.exp(alpha2 + shape2(d)), test_covs2),
+    "linear GLM": test_loglik(lambda d: fit_linear.predict(sm.add_constant(d[covs])), test_covs2),
+    "BRT":        test_loglik(lambda d: fit_brt.predict(d[covs]), test_covs2),
+    "Maxent":     test_loglik(maxent_intensity, test_covs2),
+    "constant":   test_loglik(lambda d: np.full(len(d), len(pres_covs2) / region_area), test_covs2),
+}, name="test log-likelihood").round(1)
+```
+
+(A `lambda` is a small unnamed function, so `lambda d: ...` means "a function of `d` that returns
+...". Each one here returns a model's fitted intensity for a table of covariates.)
+
+The maps, on a common color scale capped at the true maximum (`imshow` colors higher values with the
+top color):
+
+```{python}
+pred_maps = {"Truth": lambda2_map}
+for name, intensity in [("Linear GLM (DWPR)", lambda d: fit_linear.predict(sm.add_constant(d[covs]))),
+                        ("BRT (Poisson, DWPR weights)", lambda d: fit_brt.predict(d[covs])),
+                        ("Maxent (elapid)", maxent_intensity)]:
+    m = np.full(lambda_map.shape, np.nan)
+    m[row, col] = intensity(all_cells)
+    pred_maps[name] = m
+
+fig, axes = plt.subplots(2, 2, figsize=(13, 7.5), constrained_layout=True)
+for ax, (name, m) in zip(axes.flat, pred_maps.items()):
+    sdm.plot_map(m, env_stack, ax=ax, title=name, vmin=0, vmax=np.nanmax(lambda2_map))
+```
+
+And the response curves: each model's log intensity as one covariate varies, with the other two held at
+0 (their average). The models differ in their overall level, so we center each curve (subtract its
+mean) to compare *shapes*:
+
+```{python}
+log_intensity = {
+    "truth":      lambda d: alpha2 + shape2(d),
+    "linear GLM": lambda d: np.log(fit_linear.predict(sm.add_constant(d[covs], has_constant="add"))),
+    "BRT":        lambda d: np.log(fit_brt.predict(d[covs])),
+    "Maxent":     lambda d: np.log(fit_maxent.predict(d[covs])),
+}
+styles = {"truth": ("black", "--"), "linear GLM": ("orange", "-"), "BRT": ("forestgreen", "-"),
+          "Maxent": ("purple", "-")}
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
+for ax, v in zip(axes, ["mdr", "mtwq", "iso"]):
+    sweep = pd.DataFrame({"mdr": np.zeros(200), "iso": 0.0, "mtwq": 0.0})   # others held at 0
+    sweep[v] = np.linspace(all_cells[v].quantile(0.01), all_cells[v].quantile(0.99), 200)
+    for name, f in log_intensity.items():
+        curve = np.asarray(f(sweep), dtype=float)
+        color, linestyle = styles[name]
+        ax.plot(sweep[v], curve - curve.mean(), color=color, linestyle=linestyle, lw=2, label=name)
+    ax.set_xlabel(v)
+    ax.set_ylabel("log intensity (centered)")
+    ax.set_title(v)
+axes[0].legend();
+```
+
+The linear GLM can't bend: it draws a nearly flat line through the hump and a tilted line through the
+step. Its test log-likelihood is far below the truth's, though still well above a constant intensity.
+Both flexible models recover the shapes and come much closer to the truth, and close to each other.
+Their curves show their characters. Maxent's quadratic features capture the hump smoothly, and its
+hinges trace the step. The BRT captures the step crisply but draws everything as small stairs, and it
+goes flat beyond the data. This isn't a contest with a fixed winner: a different species, or more
+careful tuning of either model, could reverse their order.
+
+> **Questions**
+>
+> * Why do the BRT and Maxent need just as many quadrature points as the GLM? (What do the quadrature
+>   points approximate?)
+> * Apply the standard-error rule (Check 2) to species 2, using the fitted BRT or Maxent intensity at
+>   the quadrature points to estimate $s$. Are 50,000 points enough?
+> * Look at the response curves near the edges of the data. Which model would you trust to predict
+>   into new conditions, such as a future climate?
+> * Tune the BRT (`max_leaf_nodes`, `learning_rate`) and Maxent (`beta_multiplier`,
+>   `feature_types`, `n_hinge_features`) as in Labs 5 and 6. To keep the test pattern honest, tune on
+>   a separate *validation* pattern (simulate one!). Does the order change?
+
+# References
+
+Berman, M., & Turner, T. R. (1992). Approximating point process likelihoods with GLIM. *Journal of
+the Royal Statistical Society, Series C (Applied Statistics)*, 41(1), 31–38.
+
+Elith, J., Leathwick, J. R., & Hastie, T. (2008). A working guide to boosted regression trees.
+*Journal of Animal Ecology*, 77(4), 802–813. <https://doi.org/10.1111/j.1365-2656.2008.01390.x>
+
+Fithian, W., & Hastie, T. (2013). Finite-sample equivalence in statistical models for presence-only
+data. *The Annals of Applied Statistics*, 7(4), 1917–1939. <https://doi.org/10.1214/13-AOAS667>
+
+Renner, I. W., Elith, J., Baddeley, A., Fithian, W., Hastie, T., Phillips, S. J., Popovic, G., &
+Warton, D. I. (2015). Point process models for presence-only analysis. *Methods in Ecology and
+Evolution*, 6(4), 366–379, including Appendix S1. <https://doi.org/10.1111/2041-210X.12352>
+
+Valavi, R., Guillera-Arroita, G., Lahoz-Monfort, J. J., & Elith, J. (2022). Predictive performance of
+presence-only species distribution models: A benchmark study with reproducible code. *Ecological
+Monographs*, 92(1), e01486. <https://doi.org/10.1002/ecm.1486>

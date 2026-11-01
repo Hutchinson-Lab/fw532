@@ -1,7 +1,9 @@
 ---
-title: "Demo: Sampling from a Point Process"
+title: "Demo: Point Process Models"
 subtitle: "FW 532 · R version"
 ---
+
+This demo has four parts. First we *simulate* presence points from an inhomogeneous Poisson process (IPP). Then we go the other way, as in an SDM: we *fit* a point process model to one simulated pattern, with spatstat and with downweighted Poisson regression. Next we ask how many background (quadrature) points are enough. The second and third parts follow the supplementary material of Renner et al. (2015, Appendix S1, Sections 3 and 5), and connect to Figure 1 of Valavi et al. (2022). Finally, we use the same trick to fit flexible models (boosted regression trees and maxnet) as point process models, and compare them with a linear GLM on a species with strongly nonlinear responses.
 
 # Can we sample from an IPP in R to understand it better?
 
@@ -11,6 +13,8 @@ First, let's get the spatstat library and go back to our simulation of abundance
 #| message: false
 library(terra)      # rasters (gridded maps)
 library(spatstat)   # point patterns and point processes
+library(gbm)        # boosted regression trees (last section)
+library(maxnet)     # Maxent in R (last section)
 library(here)       # file paths relative to the project folder
 
 envStack <- rast(here("data", "envStack.tif"))
@@ -67,10 +71,14 @@ Here λ is the mean count at a *site* (a cell). A point process uses the same ki
 `rpoispp()` wants a spatstat pixel image (an `im`), so we convert our raster. We give `im()` the real longitude and latitude of the pixel centres, so that areas are in square degrees. Mind the row order: terra stores rows from north to south (row 1 is the top of the map), while spatstat wants row 1 of the matrix to be the *southernmost* row (y increasing), so we flip the matrix.
 
 ```{r}
-lambdaMat <- as.matrix(lambdaRaster, wide = TRUE)   # row 1 = northernmost row
-lambdaImg <- im(lambdaMat[nrow(lambdaMat):1, ],      # flip: row 1 = southernmost row
-                xcol = xFromCol(lambdaRaster, 1:ncol(lambdaRaster)),         # longitudes, west to east
-                yrow = rev(yFromRow(lambdaRaster, 1:nrow(lambdaRaster))))    # latitudes, south to north
+# convert a single-layer terra raster to a spatstat image (we'll reuse this later)
+rasterToIm <- function(r) {
+  m <- as.matrix(r, wide = TRUE)                       # row 1 = northernmost row
+  im(m[nrow(m):1, ],                                   # flip: row 1 = southernmost row
+     xcol = xFromCol(r, 1:ncol(r)),                    # longitudes, west to east
+     yrow = rev(yFromRow(r, 1:nrow(r))))               # latitudes, south to north
+}
+lambdaImg <- rasterToIm(lambdaRaster)
 lambdaImg
 ```
 
@@ -124,3 +132,400 @@ points(bkgdSamp, col = "blue", pch = 20, cex = 0.5)
 ```
 
 For a constant intensity, the integral is just the constant times the area of the region: 0.3 × `r round(area(as.owin(bkgdImg)))` square degrees of land ≈ `r round(integral(bkgdImg))` points expected. In Maxent (Lab 6), background points play this role: a sample of the available environments that is used to approximate the integral of λ over the region (Renner et al. 2015).
+
+# Fitting a point process model to presence-only data
+
+So far we have simulated *from* a point process. An SDM goes the other way: given presence-only records, estimate the intensity. Let's treat one simulated pattern as our presence records. Because we know the true λ, we can check the estimates.
+
+```{r}
+set.seed(2468)
+presPts <- rpoispp(lambdaImg / scaleFactor)   # our "presence-only records"
+npoints(presPts)
+```
+
+Taking logs of λ (divided by `scaleFactor`) gives the true model, a log-linear function of the covariates:
+
+$$
+\ln \lambda(s) = \beta_0 + \beta_1\,\text{MDR} + \beta_2\,\text{Iso} + \beta_3\,\text{MTWQ} + \beta_4\,\text{MDR}^2 + \beta_5\,\text{Iso} \times \text{MTWQ},
+$$
+
+with intercept $\beta_0$ = `intercept` − log(`scaleFactor`). We'll fit a model of exactly this form, so any differences from the truth come from estimation, not misspecification.
+
+```{r}
+trueCoefs <- c("(Intercept)" = intercept - log(scaleFactor), mdr = beta1, iso = beta2,
+               mtwq = beta3, "I(mdr^2)" = beta4, "iso:mtwq" = beta5)
+
+# the three covariates, with short names for formulas
+covStack <- c(envStack$Mean.Diurnal.Range, envStack$Isothermality,
+              envStack$Mean.Temperature.of.Wettest.Quarter)
+names(covStack) <- c("mdr", "iso", "mtwq")
+```
+
+## The standard tool: spatstat's ppm()
+
+`ppm()` fits Poisson point process models by maximum likelihood (Appendix S1, Section 3). It takes the point pattern, a model formula, and the covariates as images.
+
+```{r}
+covImgs <- lapply(as.list(covStack), rasterToIm)   # one spatstat image per covariate
+names(covImgs) <- names(covStack)
+
+fitPPM <- ppm(presPts ~ mdr + iso + mtwq + I(mdr^2) + iso:mtwq, covariates = covImgs)
+round(cbind(truth = trueCoefs, ppm = coef(fitPPM)), 3)
+```
+
+The log-likelihood of an IPP with presence points $s_1, \dots, s_m$ in a region $A$ is
+
+$$
+\ell(\beta) = \sum_{i=1}^{m} \ln \lambda(s_i) \;-\; \int_A \lambda(s)\,ds .
+$$
+
+The integral has no closed form, so it is approximated by *quadrature*: evaluate λ at a set of quadrature points and add up the values with weights (areas). `ppm()` did this with a grid of "dummy" points:
+
+```{r}
+quad.ppm(fitPPM)
+```
+
+These dummy points are what SDM software calls **background points**. Seen this way, background points are not pseudo-absences. They are a device for estimating the integral, so the question to ask about them is how many are needed to estimate it accurately (Renner et al. 2015). We'll come back to that question below.
+
+## Downweighted Poisson regression (DWPR)
+
+Berman & Turner (1992) showed that the quadrature approximation turns the IPP log-likelihood into a weighted Poisson regression, so any GLM software can fit it. Renner et al. (2015, Appendix S1, Section 5.2) gave a simple recipe, *downweighted Poisson regression*. Take the $m$ presence points and $n$ quadrature points drawn at random from the region. Then:
+
+* give each **quadrature point** weight $w = |A|/n$ (its share of the region's area) and response $z = 0$;
+* give each **presence point** a tiny weight $w = \epsilon$ and response $z = 1/\epsilon$;
+* fit a Poisson GLM of $z$ with prior weights $w$.
+
+The weighted Poisson log-likelihood, $\sum_k w_k (z_k \ln \mu_k - \mu_k)$, is then
+
+$$
+\sum_{i=1}^{m} \ln \lambda(s_i) \;-\; \frac{|A|}{n}\sum_{j=1}^{n} \lambda(q_j) \;-\; \underbrace{\epsilon \sum_{i=1}^{m} \lambda(s_i)}_{\approx\, 0},
+$$
+
+which is the IPP log-likelihood, with the integral estimated as |A| × (average of λ over the quadrature points). Here is that recipe as a function. The quadrature points are drawn from the region's grid cells, so we first make a table of every cell and its covariate values.
+
+```{r}
+allCells <- as.data.frame(covStack, xy = TRUE, na.rm = TRUE)   # one row per cell in the region
+regionArea <- nrow(allCells) * cellArea                         # |A|, in square degrees
+presCovs <- extract(covStack, cbind(presPts$x, presPts$y))      # covariates at the presence points
+
+# presences + quadrature points, with DWPR weights (wt) and response (z)
+dwprData <- function(quadPts, pres = presCovs, eps = 1e-6) {
+  dat <- rbind(data.frame(Pres = 1, pres),
+               data.frame(Pres = 0, quadPts[, c("mdr", "iso", "mtwq")]))
+  dat$wt <- ifelse(dat$Pres == 1, eps, regionArea / nrow(quadPts))  # quadrature weights
+  dat$z <- dat$Pres / dat$wt                                        # 1/eps at presences, 0 at quadrature points
+  dat
+}
+
+fitDWPR <- function(quadPts, eps = 1e-6) {
+  dat <- dwprData(quadPts, eps = eps)
+  # glm() warns that z isn't a whole number; that's expected with this trick
+  fit <- suppressWarnings(glm(z ~ mdr + iso + mtwq + I(mdr^2) + iso:mtwq,
+                              family = poisson(), weights = wt, data = dat))
+  mu <- fitted(fit)
+  list(fit = fit,
+       logLik = sum(dat$wt * (dat$z * log(mu) - mu)),   # the IPP log-likelihood (Appendix S1, Section 5.3)
+       quadIntensity = mu[dat$Pres == 0])                # fitted intensity at the quadrature points
+}
+```
+
+Let's fit it with 10,000 random quadrature points, Maxent's default number of background points:
+
+```{r}
+set.seed(1357)
+quad10k <- allCells[sample(nrow(allCells), 10000), ]
+dwpr10k <- fitDWPR(quad10k)
+round(cbind(truth = trueCoefs, ppm = coef(fitPPM), DWPR = coef(dwpr10k$fit),
+            SE = sqrt(diag(vcov(dwpr10k$fit)))), 3)
+```
+
+Both fits land close to the true coefficients, mostly within about two standard errors. Unlike presence–background logistic regression, DWPR estimates the intercept on the scale of the intensity (points per square degree), so its fitted values are a proper intensity map:
+
+```{r}
+#| fig-height: 3.6
+predDWPR <- predict(covStack, dwpr10k$fit, type = "response")
+plot(c(lambdaRaster / scaleFactor, predDWPR), range = c(0, max(values(predDWPR), na.rm = TRUE)),
+     main = c("True intensity", "DWPR estimate"))
+```
+
+::: {.callout-note collapse="true" title="The link to logistic regression and Maxent (IWLR)"}
+Fithian & Hastie (2013) showed that a logistic regression of presences against background points, with a huge weight $W$ on the background points, recovers the same slopes. This is *infinitely weighted logistic regression* (IWLR). It is how `maxnet` fits Maxent, with $W = 100$ (Lab 6). The intercept, though, is arbitrary: it is shifted by log(W·n/|A|). That's why Maxent's raw output is only *proportional* to the intensity (Appendix S1, Section 5.1).
+
+```{r}
+dat <- rbind(data.frame(Pres = 1, presCovs), data.frame(Pres = 0, quad10k[, c("mdr", "iso", "mtwq")]))
+dat$wt <- (1e6)^(1 - dat$Pres)   # W = 10^6 on background points, 1 on presences
+fitIWLR <- suppressWarnings(glm(Pres ~ mdr + iso + mtwq + I(mdr^2) + iso:mtwq,
+                                family = binomial(), weights = wt, data = dat))
+round(cbind(IWLR = coef(fitIWLR), DWPR = coef(dwpr10k$fit)), 3)
+c(interceptGap = unname(coef(dwpr10k$fit)[1] - coef(fitIWLR)[1]),
+  logWnOverA = log(1e6 * nrow(quad10k) / regionArea))
+```
+:::
+
+# Are there enough background points?
+
+Every number above depends on the integral being estimated well. With too few quadrature points, the log-likelihood (and so the coefficients, standard errors, and model comparisons) carry extra error that has nothing to do with the species. Renner et al. (2015) suggest two ways to check.
+
+## Check 1: does the log-likelihood settle down?
+
+Refit the model with more and more random quadrature points and see where the maximized log-likelihood stops changing (Appendix S1, Section 5.3; Renner et al. 2015, Fig. 2b). Because the points are random, we repeat each size several times to see how much the answer varies from one set of quadrature points to another.
+
+We also have a reference value. Our covariates are constant within each grid cell, so using *every* cell as a quadrature point (weight = one cell's area) computes the integral exactly at the resolution of our data.
+
+```{r}
+dwprAll <- fitDWPR(allCells)   # every cell: the exact integral at this resolution
+
+nQuad <- c(500, 1000, 2000, 5000, 10000, 20000, 50000)
+nReps <- 20
+set.seed(8642)
+logLiks <- sapply(nQuad, function(n)
+  replicate(nReps, fitDWPR(allCells[sample(nrow(allCells), n), ])$logLik))   # nReps x length(nQuad)
+```
+
+```{r}
+#| fig-height: 4.5
+plot(rep(nQuad, each = nReps), logLiks, log = "x", pch = 20, col = rgb(0, 0, 0, 0.4),
+     xlab = "Number of random quadrature points (log scale)", ylab = "Maximized log-likelihood",
+     main = paste(nReps, "random sets of quadrature points at each size"))
+abline(h = dwprAll$logLik, col = "red", lty = 2)
+legend("bottomright", c("each fit", "all cells (exact)"), pch = c(20, NA), lty = c(NA, 2),
+       col = c("grey30", "red"), bty = "n")
+```
+
+With a few hundred quadrature points, the log-likelihood can be off by tens of units, depending only on which points were drawn. The spread narrows as $n$ grows.
+
+This is the same check as Figure 1 of Valavi et al. (2022), the model benchmark we read in Week 6. Before choosing the number of background points for their study, they refitted MaxEnt with 100 to 100,000 random background points, repeating each size 10 times. They compared the results with a "gold standard" model that used every cell in the landscape as background, just like our all-cells reference line. Their yardstick was predictive performance (test AUC) rather than the log-likelihood; Renner et al. (2015) suggest either. Valavi et al. chose 50,000 background points, the size at which the replicates came close to the gold standard.
+
+## Check 2: the standard error of the integral
+
+Renner et al. (2015, p. 370) point out that this spread can be predicted with a familiar formula. With $n$ random quadrature points, the integral is estimated as |A| times the *average* fitted intensity at those points. That's a sample mean, so its standard error is the usual one:
+
+$$
+\text{SE}(n) = \frac{|A|\, s}{\sqrt{n}},
+$$
+
+where $s$ is the standard deviation of the fitted intensity across the region, estimated from the quadrature points of an initial fit. Turned around, this tells us how many points we need. If we want the SE to be at most some tolerance $\tau$ (in log-likelihood units), we need
+
+$$
+n \;\ge\; \left(\frac{|A|\, s}{\tau}\right)^2 .
+$$
+
+Renner et al. used $\tau = 2$. That is a sensible scale: differences of a couple of log-likelihood units are what decide model comparisons. For example, a likelihood-ratio test for one extra term at the 5% level needs a difference of 1.92.
+
+```{r}
+s <- sd(dwpr10k$quadIntensity)              # spread of the fitted intensity, from the 10,000-point fit
+seLogLik <- function(n) regionArea * s / sqrt(n)
+tolerance <- 2
+nRequired <- ceiling((regionArea * s / tolerance)^2)
+data.frame(s = round(s, 3), SEwith10000 = round(seLogLik(10000), 2),
+           nRequired = nRequired, cellsInRegion = nrow(allCells))
+```
+
+How well does the formula predict the simulation? Compare the standard deviation of the 20 log-likelihoods at each size with SE(n):
+
+```{r}
+round(rbind(n = nQuad, simulatedSD = apply(logLiks, 2, sd), formulaSE = seLogLik(nQuad)), 2)
+```
+
+```{r}
+#| fig-height: 4.5
+plot(rep(nQuad, each = nReps), logLiks, log = "x", pch = 20, col = rgb(0, 0, 0, 0.4),
+     xlab = "Number of random quadrature points (log scale)", ylab = "Maximized log-likelihood",
+     main = "Simulation vs. the standard-error formula")
+nGrid <- 10^seq(log10(400), log10(60000), length.out = 100)
+lines(nGrid, dwprAll$logLik + 2 * seLogLik(nGrid), col = "blue")
+lines(nGrid, dwprAll$logLik - 2 * seLogLik(nGrid), col = "blue")
+abline(h = dwprAll$logLik, col = "red", lty = 2)
+abline(v = nRequired, col = "blue", lty = 3)
+legend("bottomright", c("each fit", "all cells (exact)", "± 2 SE from the formula", "n needed for SE ≤ 2"),
+       pch = c(20, NA, NA, NA), lty = c(NA, 2, 1, 3), col = c("grey30", "red", "blue", "blue"), bty = "n")
+```
+
+The formula tracks the simulation reasonably well. (With only 20 replicates, the simulated standard deviations are themselves noisy, by roughly ±15%.) So one quick initial fit tells us roughly how many background points are needed, without running all the replicates. For this species the rule asks for about `r format(nRequired, big.mark = ",")` points, the same order as the 50,000 that Valavi et al. (2022) settled on by the slower, replicate-based route. At the largest sizes the simulated spread is a bit *smaller* than the formula predicts. That's because we are sampling without replacement from a finite set of cells: with half of all cells in the sample, the SE shrinks by a factor of about $\sqrt{1 - n/N}$, and with every cell the integral is exact.
+
+## How much does it matter for the coefficients?
+
+The log-likelihood matters for comparing models. What about the coefficients themselves? Here is how much they vary across random sets of quadrature points, next to their usual (model-based) standard errors:
+
+```{r}
+set.seed(9753)
+coefSD <- sapply(c(1000, 10000, 50000), function(n) {
+  coefs <- t(replicate(nReps, coef(fitDWPR(allCells[sample(nrow(allCells), n), ])$fit)))
+  apply(coefs, 2, sd)
+})
+colnames(coefSD) <- paste0("quadratureSD_n", c(1000, 10000, 50000))
+round(cbind(modelSE = sqrt(diag(vcov(dwprAll$fit))), coefSD), 3)
+```
+
+With 1,000 quadrature points, the error from quadrature is comparable to the statistical uncertainty in the coefficients, and that extra error isn't reflected in the reported standard errors. With tens of thousands of points it becomes small by comparison. Renner et al. (2015) make the same point: quadrature error can be modest relative to the coefficients' standard errors, but only once there are enough points.
+
+::: {.callout-tip title="Questions"}
+* Maxent's default is 10,000 background points. Is that enough for this species, by the τ = 2 rule?
+* Does the formula for the required number of points depend on how many presences you have? Try `scaleFactor <- 5` (about five times as many presences) and rerun: how do $s$ and the required $n$ change, and why?
+* Which features of a species' intensity surface would make the integral harder to estimate, so that more background points are needed?
+:::
+
+::: {.callout-important title="Exercise"}
+`ppm()` used a regular *grid* of dummy points rather than random points. Refit `fitPPM` with `nd = c(691, 385)` (one dummy point per cell) and compare `logLik()` with `dwprAll$logLik`. Then try a few coarser grids (e.g. `nd = 100`, `nd = 200`). Do grids reach the exact value faster than random points do? Renner et al. (2015, Fig. 2a) checked convergence with a grid of decreasing spacing.
+:::
+
+# Beyond GLMs: flexible models as point process models
+
+DWPR turns fitting a point process model into fitting a weighted Poisson regression. So any method that can fit a Poisson model with observation weights can fit a point process model, not just GLMs. Renner et al. (2015) make this point for DWPR, and Fithian & Hastie (2013) make the same point for weighted logistic regression. Two flexible methods from this course qualify:
+
+* **Boosted regression trees.** The gbm package fits Poisson BRTs (`distribution = "poisson"`) and accepts observation `weights`, so we can give it exactly the same response `z` and weights `wt` as the GLM. The trees learn the shapes of the responses and any interactions from the data, and the model still estimates the intensity on its true scale.
+* **Maxent.** `maxnet` fits Maxent by infinitely weighted logistic regression (see the IWLR callout above). It expands each covariate into many features (linear, quadratic, product, hinge) and uses L1 regularization to keep only the ones that help (Lab 6).
+
+Using point-process weights for BRTs is not the usual practice. In their benchmark, Valavi et al. (2022) fitted BRTs as presence-vs-background *classifiers* (Bernoulli loss), with the background points down-weighted so that their total weight equals that of the presences. That is the approach Renner et al. (2015) call statistically naïve. Valavi et al. used point-process weighting only for GLMs and GAMs.
+
+Our first species is a poor test of flexible methods, though. Its true intensity has a quadratic term and an interaction, but the GLM we fitted contained *exactly* those terms: it was told the true formula. Those effects were also mild. In a real analysis nobody tells you the form. So let's simulate a second species whose responses a simple GLM can't represent, and compare three models that are *not* told the form: a linear GLM, a Poisson BRT, and maxnet.
+
+## A species with nonlinear responses
+
+Species 2 has a hump-shaped response to mean diurnal range (an optimum near its average), a sharp threshold in the temperature of the wettest quarter, and a steady decline with isothermality:
+
+$$
+\ln \lambda_2(s) = \alpha_2 - 0.8\,\text{MDR}^2 + 1.5 \cdot \mathbb{1}[\text{MTWQ} > 0] - 0.5\,\text{Iso},
+$$
+
+where $\mathbb{1}[\cdot]$ is 1 when the condition holds and 0 otherwise. We pick $\alpha_2$ so that about 900 points are expected. The same function works on a data frame or directly on the raster stack, because terra applies the arithmetic and comparisons cell by cell.
+
+```{r}
+shape2 <- function(d) -0.8 * d$mdr^2 + 1.5 * (d$mtwq > 0) - 0.5 * d$iso   # hump + step + linear
+alpha2 <- log(900 / (sum(exp(shape2(allCells))) * cellArea))                # gives ~900 expected points
+lambda2 <- exp(alpha2 + shape2(covStack))
+lambda2Img <- rasterToIm(lambda2)
+
+set.seed(4321)
+presPts2 <- rpoispp(lambda2Img)   # training "presence records"
+set.seed(5555)
+testPts2 <- rpoispp(lambda2Img)   # an independent test pattern from the same process
+presCovs2 <- extract(covStack, cbind(presPts2$x, presPts2$y))
+testCovs2 <- extract(covStack, cbind(testPts2$x, testPts2$y))
+c(training = nrow(presCovs2), test = nrow(testCovs2))
+```
+
+```{r}
+#| fig-height: 4.5
+plot(lambda2, main = "True intensity of species 2, with its training points")
+points(presPts2$x, presPts2$y, pch = 20, cex = 0.3, col = "red")
+```
+
+## Fitting the three models
+
+All three models get the same 50,000 random quadrature (background) points. That's the number Valavi et al. (2022) chose, and close to what the standard-error rule asked for with species 1. (Checking it for species 2 is one of the questions below.)
+
+```{r}
+set.seed(6666)
+quad2 <- allCells[sample(nrow(allCells), 50000), ]
+dat2 <- dwprData(quad2, pres = presCovs2)   # DWPR response (z) and weights (wt) for species 2
+```
+
+**A linear GLM** (DWPR), the simplest model you might try without knowing the form:
+
+```{r}
+fitLinear <- suppressWarnings(glm(z ~ mdr + iso + mtwq, family = poisson(), weights = wt, data = dat2))
+```
+
+**A Poisson BRT** with the same response and weights. As in Lab 5, cross-validation chooses the number of trees:
+
+```{r}
+#| fig-height: 4
+set.seed(97531)
+fitBRT <- gbm(z ~ mdr + iso + mtwq, data = dat2,
+              distribution = "poisson", weights = wt,   # Poisson loss + quadrature weights
+              n.trees = 2500, interaction.depth = 2, shrinkage = 0.01,
+              bag.fraction = 0.5, cv.folds = 5, verbose = FALSE)
+bestTrees <- gbm.perf(fitBRT, method = "cv")   # plots training and CV deviance; returns the best number of trees
+bestTrees
+```
+
+(Prefer Lab 5's `gbm.step()`? It accepts the same model with `family = "poisson"` and `site.weights = dat2$wt`. It is slower here because it uses 10-fold cross-validation on a large dataset.)
+
+**maxnet**, given the presences and the same quadrature points as background. With more than 80 presences, it uses linear, quadratic, product, and hinge features by default. `addsamplestobackground = FALSE` keeps the presences out of the background. Renner et al. (2015, Appendix S1, Section 6) point out that this is needed for the equivalence with a point process model.
+
+```{r}
+fitMaxnet <- maxnet(p = dat2$Pres, data = dat2[, c("mdr", "iso", "mtwq")], addsamplestobackground = FALSE)
+```
+
+maxnet's output is only *proportional* to the intensity, because the IWLR intercept is arbitrary. For a Poisson point process, the maximum-likelihood intercept makes the expected number of points, $\int_A \lambda(s)\,ds$, equal the number observed. So we rescale maxnet's exponential output to make its integral, estimated with the same quadrature points, equal to the number of presences:
+
+```{r}
+maxnetRaw <- function(d) exp(predict(fitMaxnet, d, type = "link"))
+maxnetScale <- nrow(presCovs2) / (regionArea * mean(maxnetRaw(quad2)))
+maxnetIntensity <- function(d) maxnetScale * maxnetRaw(d)
+```
+
+## Comparing the models
+
+First, the test log-likelihood of each model on the independent test pattern (with the integral computed exactly over every cell), with the truth and a constant intensity for reference:
+
+```{r}
+testLogLik <- function(intensity, testCovs) {
+  sum(log(intensity(testCovs))) - sum(intensity(allCells)) * cellArea
+}
+round(c(truth     = testLogLik(function(d) exp(alpha2 + shape2(d)), testCovs2),
+        linearGLM = testLogLik(function(d) predict(fitLinear, d, type = "response"), testCovs2),
+        BRT       = testLogLik(function(d) predict(fitBRT, d, n.trees = bestTrees, type = "response"), testCovs2),
+        maxnet    = testLogLik(maxnetIntensity, testCovs2),
+        constant  = testLogLik(function(d) rep(nrow(presCovs2) / regionArea, nrow(d)), testCovs2)), 1)
+```
+
+The maps:
+
+```{r}
+#| fig-height: 6
+maps2 <- c(lambda2,
+           predict(covStack, fitLinear, type = "response"),
+           predict(covStack, fitBRT, n.trees = bestTrees, type = "response", na.rm = TRUE),
+           maxnetScale * exp(predict(covStack, fitMaxnet, type = "link", na.rm = TRUE)))
+# common color scale, capped at the true maximum (higher predictions get the top color)
+plot(maps2, nc = 2, range = c(0, global(lambda2, "max", na.rm = TRUE)[1, 1]), fill_range = TRUE,
+     main = c("Truth", "Linear GLM (DWPR)", "BRT (Poisson, DWPR weights)", "maxnet"))
+```
+
+And the response curves: each model's log intensity as one covariate varies, with the other two held at 0 (their average). The models differ in their overall level, so we center each curve (subtract its mean) to compare *shapes*:
+
+```{r}
+#| fig-height: 3.6
+logIntensity <- list(truth     = function(d) alpha2 + shape2(d),
+                     linearGLM = function(d) predict(fitLinear, d),
+                     BRT       = function(d) predict(fitBRT, d, n.trees = bestTrees),
+                     maxnet    = function(d) predict(fitMaxnet, d, type = "link"))
+cols <- c(truth = "black", linearGLM = "orange", BRT = "forestgreen", maxnet = "purple")
+
+par(mfrow = c(1, 3), mar = c(4, 4, 2, 1))
+for (v in c("mdr", "mtwq", "iso")) {
+  sweepGrid <- data.frame(mdr = rep(0, 200), iso = 0, mtwq = 0)   # others held at 0
+  sweepGrid[[v]] <- seq(quantile(allCells[[v]], 0.01), quantile(allCells[[v]], 0.99), length.out = 200)
+  curves <- sapply(logIntensity, function(f) f(sweepGrid))
+  curves <- sweep(curves, 2, colMeans(curves))                   # center each curve
+  matplot(sweepGrid[[v]], curves, type = "l", lty = c(2, 1, 1, 1), lwd = 2, col = cols,
+          xlab = v, ylab = "log intensity (centered)", main = v)
+  if (v == "mdr") legend("bottom", names(cols), col = cols, lty = c(2, 1, 1, 1), lwd = 2, bty = "n", cex = 0.85)
+}
+par(mfrow = c(1, 1))
+```
+
+The linear GLM can't bend: it draws a nearly flat line through the hump and a tilted line through the step. Its test log-likelihood is far below the truth's, though still well above a constant intensity. Both flexible models recover the shapes and come much closer to the truth, and close to each other. Their curves show their characters. maxnet's quadratic features capture the hump smoothly, and its hinges trace the step. The BRT captures the step crisply but draws everything as small stairs, and it goes flat beyond the data. This isn't a contest with a fixed winner: a different species, or more careful tuning of either model, could reverse their order.
+
+::: {.callout-tip title="Questions"}
+* Why do the BRT and maxnet need just as many quadrature points as the GLM? (What do the quadrature points approximate?)
+* Apply the standard-error rule (Check 2) to species 2, using the fitted BRT or maxnet intensity at the quadrature points to estimate $s$. Are 50,000 points enough?
+* Look at the response curves near the edges of the data. Which model would you trust to predict into new conditions, such as a future climate?
+* Tune the BRT (`interaction.depth`, `shrinkage`) and maxnet (`regmult`, `classes` in `maxnet.formula()`) as in Labs 5 and 6. To keep the test pattern honest, tune on a separate *validation* pattern (simulate one!). Does the order change?
+:::
+
+# References
+
+Baddeley, A., & Turner, R. (2005). spatstat: An R package for analyzing spatial point patterns. *Journal of Statistical Software*, 12(6), 1–42. <https://doi.org/10.18637/jss.v012.i06>
+
+Berman, M., & Turner, T. R. (1992). Approximating point process likelihoods with GLIM. *Journal of the Royal Statistical Society, Series C (Applied Statistics)*, 41(1), 31–38.
+
+Elith, J., Leathwick, J. R., & Hastie, T. (2008). A working guide to boosted regression trees. *Journal of Animal Ecology*, 77(4), 802–813. <https://doi.org/10.1111/j.1365-2656.2008.01390.x>
+
+Fithian, W., & Hastie, T. (2013). Finite-sample equivalence in statistical models for presence-only data. *The Annals of Applied Statistics*, 7(4), 1917–1939. <https://doi.org/10.1214/13-AOAS667>
+
+Renner, I. W., Elith, J., Baddeley, A., Fithian, W., Hastie, T., Phillips, S. J., Popovic, G., & Warton, D. I. (2015). Point process models for presence-only analysis. *Methods in Ecology and Evolution*, 6(4), 366–379, including Appendix S1. <https://doi.org/10.1111/2041-210X.12352>
+
+Valavi, R., Guillera-Arroita, G., Lahoz-Monfort, J. J., & Elith, J. (2022). Predictive performance of presence-only species distribution models: A benchmark study with reproducible code. *Ecological Monographs*, 92(1), e01486. <https://doi.org/10.1002/ecm.1486>

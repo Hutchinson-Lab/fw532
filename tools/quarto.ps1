@@ -11,8 +11,17 @@
 $env:QUARTO_R = "C:\Program Files\R\R-4.5.2\bin"
 $env:QUARTO_PYTHON = Join-Path $HOME ".venvs\fw532\Scripts\python.exe"
 
-$quarto = (Get-Command quarto -ErrorAction SilentlyContinue).Source
+# Find Quarto: a standalone install on the PATH first, then the copies bundled with Positron
+# (which moves into a "_" subfolder while an update is pending) and RStudio.
+$candidates = @(
+  (Get-Command quarto -ErrorAction SilentlyContinue).Source,
+  (Join-Path $env:LOCALAPPDATA "Programs\Positron\resources\app\quarto\bin\quarto.exe"),
+  (Join-Path $env:LOCALAPPDATA "Programs\Positron\_\resources\app\quarto\bin\quarto.exe"),
+  "C:\Program Files\RStudio\resources\app\bin\quarto\bin\quarto.exe"
+)
+$quarto = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 if (-not $quarto) {
-  $quarto = Join-Path $env:LOCALAPPDATA "Programs\Positron\resources\app\quarto\bin\quarto.exe"  # bundled with Positron
+  Write-Error "Couldn't find Quarto. Install it from https://quarto.org/docs/get-started/ and try again."
+  exit 1
 }
 & $quarto @args
