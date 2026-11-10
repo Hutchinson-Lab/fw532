@@ -3,7 +3,7 @@ title: "Demo: Point Process Models"
 subtitle: "FW 532 · R version"
 ---
 
-This demo has four parts. First we *simulate* presence points from an inhomogeneous Poisson process (IPP). Then we go the other way, as in an SDM: we *fit* a point process model to one simulated pattern, with spatstat and with downweighted Poisson regression. Next we ask how many background (quadrature) points are enough. The second and third parts follow the supplementary material of Renner et al. (2015, Appendix S1, Sections 3 and 5), and connect to Figure 1 of Valavi et al. (2022). Finally, we use the same trick to fit flexible models (boosted regression trees and maxnet) as point process models, and compare them with a linear GLM on a species with strongly nonlinear responses.
+This demo has five parts. First we *simulate* presence points from an inhomogeneous Poisson process (IPP). Then we go the other way, as in an SDM: we *fit* a point process model to one simulated pattern, with spatstat and with downweighted Poisson regression. Next we ask how many background (quadrature) points are enough. The second and third parts follow the supplementary material of Renner et al. (2015, Appendix S1, Sections 3 and 5), and connect to Figure 1 of Valavi et al. (2022). Fourth, we use the same trick to fit flexible models (boosted regression trees and maxnet) as point process models, and compare them with a linear GLM on a species with strongly nonlinear responses. Finally, we add sampling bias: we check a model with Ripley's K function, and compare three remedies (a bias covariate, an area-interaction model, and thinning the records with spThin).
 
 # Can we sample from an IPP in R to understand it better?
 
@@ -13,8 +13,9 @@ First, let's get the spatstat library and go back to our simulation of abundance
 #| message: false
 library(terra)      # rasters (gridded maps)
 library(spatstat)   # point patterns and point processes
-library(gbm)        # boosted regression trees (last section)
-library(maxnet)     # Maxent in R (last section)
+library(gbm)        # boosted regression trees (flexible models)
+library(maxnet)     # Maxent in R (flexible models)
+library(spThin)     # spatial thinning of records (sampling bias)
 library(here)       # file paths relative to the project folder
 
 envStack <- rast(here("data", "envStack.tif"))
@@ -534,7 +535,298 @@ The linear GLM can't bend: it draws a nearly flat line through the hump and a ti
 * Tune the BRT (`interaction.depth`, `shrinkage`) and maxnet (`regmult`, `classes` in `maxnet.formula()`) as in Labs 5 and 6. To keep the test pattern honest, tune on a separate *validation* pattern (simulate one!). Does the order change?
 :::
 
+# Sampling bias and spatial dependence
+
+So far every individual had the same chance, 1 in `scaleFactor`, of becoming a record. Real records come from people, and people look much harder in some places than others: near towns, roads, and field stations. In point-process terms, records are a *thinned* version of the individuals. If an individual at location $s$ becomes a record with probability $p(s)$, independently of the others, the records are again a Poisson process, with intensity
+
+$$
+\lambda_{\text{records}}(s) = p(s)\,\lambda(s), \qquad \ln \lambda_{\text{records}}(s) = \ln \lambda(s) + \ln p(s).
+$$
+
+When $p$ is constant, a PPM recovers λ up to a constant, which only shifts the intercept. When $p(s)$ varies, the model estimates λ × effort. Because the bias enters the log intensity as an extra term, $\ln p(s)$, any environmental covariate that is correlated with effort absorbs part of it. Then the slopes are biased, not just the intercept.
+
+This section follows Renner et al. (2015) and its Appendix S1 (Section 3). We simulate biased records for species 1, fit a PPM that ignores the bias, and check it with Ripley's K function. Then we try three remedies: measuring the bias, modeling the extra spatial dependence, and thinning the records with spThin.
+
+## Simulating biased records
+
+We place 30 "towns" at random, favoring places with a warm wettest quarter (high MTWQ), and let survey effort fall off with the distance $d$ to the nearest town:
+
+$$
+p(s) = \frac{1}{1 + d(s)/(50\ \text{km})} .
+$$
+
+Effort is 1 at a town, 1/2 at 50 km, and about 1/11 at 500 km. We scale the intensity so that about 1,000 records are expected, as before.
+
+```{r}
+set.seed(97531)
+townCells <- sample(nrow(allCells), 30, prob = exp(allCells$mtwq))   # towns favor high MTWQ
+towns <- allCells[townCells, c("x", "y")]
+distKm <- distance(covStack$mdr, vect(towns, geom = c("x", "y"), crs = crs(covStack)), unit = "km")
+distKm <- mask(distKm, covStack$mdr)       # distance (km) from each cell to the nearest town
+effort <- 1 / (1 + distKm / 50)            # relative chance that an individual becomes a record
+effortImg <- rasterToIm(effort)
+
+biasScale <- integral(lambdaImg * effortImg) / 1000      # so that about 1,000 records are expected
+set.seed(8642)
+biasPts <- rpoispp(lambdaImg * effortImg / biasScale)   # biased presence-only records
+npoints(biasPts)
+```
+
+```{r}
+#| fig-height: 3.4
+plot(c(effort, lambdaRaster / scaleFactor), main = c("Survey effort, with towns", "True intensity, with biased records"),
+     fun = function(i) if (i == 1) points(towns, pch = 17, col = "red", cex = 0.7)
+                       else points(biasPts$x, biasPts$y, pch = 20, cex = 0.25))
+```
+
+The records pile up around the towns. Far from any town the species is just as common, but hardly anyone looks.
+
+## A PPM that ignores the bias
+
+First, the analysis we would do if we didn't think about effort: the same PPM as before, with only the environmental covariates. Effort changes over tens of kilometers near the towns, so we give `ppm()` a finer grid of dummy points than its default (`nd = 256`, about 28,000 points on land).
+
+```{r}
+fitIgnoring <- ppm(biasPts ~ mdr + iso + mtwq + I(mdr^2) + iso:mtwq, covariates = covImgs, nd = 256)
+coefTable <- function(...) round(sapply(list(...), function(f) coef(f)[names(trueCoefs)]), 3)
+cbind(truth = round(trueCoefs, 3), coefTable(unbiased = fitPPM, ignoringBias = fitIgnoring),
+      SE = round(sqrt(diag(vcov(fitIgnoring))), 3))
+```
+
+The MTWQ slope is about twice its true value, and the MDR slope is too large as well. The model has learned the towns' preference for a warm wettest quarter as if it were the species'. Nothing in the output warns us: the standard errors are small, and the estimates look as plausible as the unbiased ones.
+
+## Ripley's K: is there clustering the covariates don't explain?
+
+A Poisson PPM assumes the records are independent once the covariates are taken into account (Renner et al. 2015). Ripley's K function checks this. $K(r)$ is the expected number of *other* points within distance $r$ of a typical point, divided by the intensity; for a homogeneous Poisson process it equals $\pi r^2$. The *inhomogeneous* K function (Baddeley, Møller & Waagepetersen 2000) weights each pair of points by $1/(\lambda(s_i)\lambda(s_j))$, using the fitted intensity, so that it still equals $\pi r^2$ when the fitted Poisson model is right. It is easiest to read as $L(r) - r$, where $L(r) = \sqrt{K(r)/\pi}$:
+
+* $L(r) - r \approx 0$: no more clustering than the covariates explain;
+* $L(r) - r > 0$: extra clustering at distance $r$;
+* $L(r) - r < 0$: points are more evenly spaced (*regular*) than the model predicts.
+
+How far from 0 is too far? We simulate 39 patterns from the fitted model, refit the model to each one (`lambda = fit`), and compute the same function for each. The grey band, the *envelope*, shows the range of the 39 simulated curves at each distance. A single test over all distances is the Diggle–Cressie–Loosmore–Ford (DCLF) test (Baddeley et al. 2014). It adds up the squared deviation of the observed curve from the simulations' average, and compares that total with the same quantity for each simulation. With 39 simulations the smallest possible p-value is 1/40 = 0.025. (Renner et al. used 1,001 simulations, which takes much longer. Even 39 take about a minute per test here.) Distances are in degrees: 1° of latitude is about 111 km.
+
+```{r}
+rr <- seq(0, 5, by = 0.05)   # distances (degrees) at which to compute L(r)
+kTest <- function(fit, seed) {
+  set.seed(seed)
+  # simulate, refit, and compute L(r) 39 times. (Each refit makes spatstat warn that it
+  # "truncated the function name" of a plot label. That's harmless, so we silence it.)
+  env <- suppressWarnings(envelope(fit, Linhom, lambda = fit, nsim = 39, r = rr,
+                                   correction = "border", savefuns = TRUE, verbose = FALSE))
+  list(envelope = env, p = dclf.test(env)$p.value)
+}
+plotK <- function(k, title) {
+  plot(k$envelope, . - r ~ r, legend = FALSE, xlab = "r (degrees)", ylab = "L(r) - r",
+       main = sprintf("%s (DCLF p = %.3f)", title, k$p))
+}
+kUnbiased <- kTest(fitPPM, 1)        # the unbiased records from earlier
+kIgnoring <- kTest(fitIgnoring, 2)   # biased records, environmental covariates only
+```
+
+```{r}
+#| fig-height: 3.6
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+plotK(kUnbiased, "Unbiased records")
+plotK(kIgnoring, "Biased records")
+par(mfrow = c(1, 1))
+```
+
+The unbiased records stay inside the envelope. The biased records rise far above it from about 1° (roughly 100 km) onward. They are much more clustered than the environment explains. The test can't say *why*. Extra clustering can come from the species (dispersal, social groups), from an environmental variable missing from the model, or from the observers. Here we know it's the observers, but in a real analysis that's a judgment call.
+
+## Remedy 1: measure the bias
+
+If we can measure what drives effort, we can put it in the model. Renner et al. (2015) used the distances to the nearest main road and urban area. Here the bias covariate is $\ln(1 + d/50\ \text{km})$. That is exactly $-\ln p(s)$, so its true coefficient is $-1$. Then, following Renner et al., we predict with the bias covariate set to a common level, $d = 0$: the intensity of records if everywhere were surveyed as hard as next to a town.
+
+```{r}
+logDistImg <- rasterToIm(log(1 + distKm / 50))   # the bias covariate
+fitBias <- ppm(biasPts ~ mdr + iso + mtwq + I(mdr^2) + iso:mtwq + logDist,
+               covariates = c(covImgs, list(logDist = logDistImg)), nd = 256)
+cbind(truth = round(trueCoefs, 3), coefTable(ignoringBias = fitIgnoring, withBiasCovariate = fitBias))
+round(coef(fitBias)["logDist"], 3)   # true value: -1
+```
+
+The environmental slopes are back near the truth, and the bias coefficient is close to $-1$. The K test agrees that nothing important is missing now:
+
+```{r}
+#| fig-height: 3.6
+kBias <- kTest(fitBias, 3)
+plotK(kBias, "Biased records, with the bias covariate")
+```
+
+To compare the maps, we use each model's *environmental* part only, $\exp(\mathbf{x}(s)'\boldsymbol\beta)$. That is the same as setting the bias covariate to 0 (that is, $d = 0$). We divide each map by its mean, because the intercepts mean different things in different models and only the *relative* intensity is comparable:
+
+```{r}
+#| fig-height: 3.6
+envPart <- function(b) {   # exp(environmental part of the log intensity) on the raster
+  exp(b["(Intercept)"] + b["mdr"] * covStack$mdr + b["iso"] * covStack$iso + b["mtwq"] * covStack$mtwq +
+      b["I(mdr^2)"] * covStack$mdr^2 + b["iso:mtwq"] * covStack$iso * covStack$mtwq)
+}
+relative <- function(r) r / global(r, "mean", na.rm = TRUE)[1, 1]
+relMaps <- c(relative(lambdaRaster), relative(envPart(coef(fitIgnoring))), relative(envPart(coef(fitBias))))
+plot(relMaps, nc = 3, range = c(0, 3), fill_range = TRUE,
+     main = c("Truth", "Ignoring the bias", "Bias covariate, at d = 0"))
+```
+
+Ignoring the bias exaggerates the intensity across the central and southern United States and northern Mexico, where most of the towns are, and understates it in the north. With the bias covariate, the map matches the truth closely.
+
+## Remedy 2: model the extra spatial dependence
+
+Often we can't measure effort. Another option is to let the model describe the clustering it can't explain. Renner et al. (2015) did this with an *area-interaction* model, a Gibbs point process. Its intensity at a location $s$ also depends on the other records nearby:
+
+$$
+\ln \lambda(s \mid \text{records}) = \mathbf{x}(s)'\boldsymbol\beta + \theta\, t(s),
+$$
+
+where $t(s)$ is the fraction of a disc of radius $r$ around $s$ that is also within $r$ of another record, i.e., covered by the discs around the other records. $\theta > 0$ means records are more likely near other records (clustering), and $\theta < 0$ means they avoid each other (inhibition).
+
+Gibbs models are fitted by *maximum pseudolikelihood*. For this model that means the same weighted Poisson regression as DWPR, with $t(s)$ as one more covariate, evaluated at the presences and the quadrature points (Baddeley & Turner 2000; Renner et al. 2015). spatstat fits this model with `ppm(..., interaction = AreaInter(r))`, as in Appendix S1, Section 3.6. On a region as large as ours that takes many minutes for each radius, so we compute $t(s)$ ourselves and fit the regression with `glm()`. (spatstat measures discs that reach into the ocean a little differently, so its numbers differ slightly.)
+
+```{r}
+# t(s): the fraction of the disc of radius r around each location that lies within r of another record.
+# We approximate the disc by 177 evenly spaced points and check each one for a record within r.
+discPts <- expand.grid(dx = seq(-1, 1, length.out = 15), dy = seq(-1, 1, length.out = 15))
+discPts <- discPts[discPts$dx^2 + discPts$dy^2 <= 1, ]
+coveredFraction <- function(x, y, recs, r, ownRecord = FALSE) {
+  owner <- rep(seq_along(x), each = nrow(discPts))   # which location each disc point belongs to
+  px <- rep(x, each = nrow(discPts)) + r * discPts$dx
+  py <- rep(y, each = nrow(discPts)) + r * discPts$dy
+  frame <- owin(range(c(px, recs$x)), range(c(py, recs$y)))
+  P <- ppp(px, py, window = frame, check = FALSE)
+  R <- ppp(recs$x, recs$y, window = frame, check = FALSE)
+  d <- if (ownRecord) {   # for a record, ignore the record itself
+    nncross(P, R, iX = owner, iY = seq_len(npoints(R)), what = "dist")
+  } else {
+    nncross(P, R, what = "dist")
+  }
+  as.numeric(tapply(d <= r, owner, mean))
+}
+
+set.seed(1357)
+quadB <- allCells[sample(nrow(allCells), 20000), ]   # quadrature points for the area-interaction fits
+presB <- data.frame(x = biasPts$x, y = biasPts$y, extract(covStack, cbind(biasPts$x, biasPts$y)))
+
+fitAreaInter <- function(r, eps = 1e-6) {
+  dat <- rbind(data.frame(Pres = 1, presB[, c("mdr", "iso", "mtwq")],
+                          covered = coveredFraction(presB$x, presB$y, biasPts, r, ownRecord = TRUE)),
+               data.frame(Pres = 0, quadB[, c("mdr", "iso", "mtwq")],
+                          covered = coveredFraction(quadB$x, quadB$y, biasPts, r)))
+  dat$wt <- ifelse(dat$Pres == 1, eps, regionArea / nrow(quadB))   # DWPR weights, as before
+  dat$z <- dat$Pres / dat$wt
+  fit <- suppressWarnings(glm(z ~ mdr + iso + mtwq + I(mdr^2) + iso:mtwq + covered,
+                              family = poisson(), weights = wt, data = dat))
+  mu <- fitted(fit)
+  list(fit = fit, logPL = sum(dat$wt * (dat$z * log(mu) - mu)))   # log pseudolikelihood
+}
+```
+
+The radius $r$ has to be chosen. As in Appendix S1 (`profilepl()`), we fit the model for several radii and keep the one with the largest pseudolikelihood:
+
+```{r}
+#| fig-height: 3.4
+radii <- c(0.25, 0.5, 1, 1.5, 2)   # degrees
+aiFits <- lapply(radii, fitAreaInter)
+logPL <- sapply(aiFits, function(f) f$logPL)
+plot(radii, logPL, type = "b", pch = 19, xlab = "Disc radius r (degrees)", ylab = "Log pseudolikelihood")
+fitAI <- aiFits[[which.max(logPL)]]$fit
+c(bestRadius = radii[which.max(logPL)], theta = round(unname(coef(fitAI)["covered"]), 2))
+cbind(truth = round(trueCoefs, 3), coefTable(ignoringBias = fitIgnoring, areaInteraction = fitAI))
+```
+
+The interaction is clearly positive: the model has found the clustering. The MTWQ slope moves part of the way back toward the truth, because some of the clustering around towns is now explained by "records near other records" instead of by the climate there. But the other slopes don't simply improve. Several shrink toward 0, and isothermality's moves *away* from the truth. The interaction term discounts every cluster, whatever its cause, so it also discounts the species' real hotspots. And the model doesn't know where the towns are, or that remote areas were barely surveyed. Renner et al. (2015) add a caution: because the parameters are not maximum-likelihood estimates, the usual standard errors, likelihood-ratio tests, and AIC may not apply.
+
+## Remedy 3: thin the records with spThin
+
+The most common fix in practice works on the data rather than the model: *spatial thinning*. spThin (Aiello-Lammens et al. 2015) repeatedly removes one of the records that has the most neighbors closer than a chosen distance, until no two records are that close. The removals are random, so it runs several times (`reps`) and we keep the run that keeps the most records. We thin to 100 km, both the biased records and, for comparison, the unbiased ones:
+
+```{r}
+thinRecords <- function(pp, km, reps = 10, seed = 1) {
+  set.seed(seed)
+  runs <- thin(data.frame(species = "sp1", lon = pp$x, lat = pp$y),
+               lat.col = "lat", long.col = "lon", spec.col = "species",
+               thin.par = km, reps = reps, locs.thinned.list.return = TRUE,
+               write.files = FALSE, write.log.file = FALSE, verbose = FALSE)
+  best <- runs[[which.max(sapply(runs, nrow))]]   # the run that kept the most records
+  ppp(best$Longitude, best$Latitude, window = Window(pp))
+}
+thinBiased <- thinRecords(biasPts, km = 100)
+thinUnbiased <- thinRecords(presPts, km = 100)
+c(biasedBefore = npoints(biasPts), biasedAfter = npoints(thinBiased),
+  unbiasedBefore = npoints(presPts), unbiasedAfter = npoints(thinUnbiased))
+```
+
+```{r}
+#| fig-height: 4
+plot(effort, main = "Biased records: kept (blue) and removed (red) by thinning to 100 km")
+points(biasPts$x, biasPts$y, pch = 20, cex = 0.3, col = "red")
+points(thinBiased$x, thinBiased$y, pch = 20, cex = 0.4, col = "blue")
+```
+
+Now fit the same PPM to the thinned records, and run the K test:
+
+```{r}
+fitThinBiased <- ppm(thinBiased ~ mdr + iso + mtwq + I(mdr^2) + iso:mtwq, covariates = covImgs, nd = 256)
+fitThinUnbiased <- ppm(thinUnbiased ~ mdr + iso + mtwq + I(mdr^2) + iso:mtwq, covariates = covImgs, nd = 256)
+cbind(truth = round(trueCoefs, 3),
+      coefTable(unbiased = fitPPM, thinnedUnbiased = fitThinUnbiased,
+                ignoringBias = fitIgnoring, thinnedBiased = fitThinBiased))
+kThinBiased <- kTest(fitThinBiased, 4)
+kThinUnbiased <- kTest(fitThinUnbiased, 5)
+```
+
+```{r}
+#| fig-height: 3.6
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+plotK(kThinUnbiased, "Unbiased, thinned")
+plotK(kThinBiased, "Biased, thinned")
+par(mfrow = c(1, 1))
+```
+
+Thinning has real benefits and real costs.
+
+**Pros**
+
+* It needs no information about effort, just the records.
+* It removed many of the records that crowd around towns, so the MTWQ slope moved toward the truth, though not all the way.
+* The large-scale clustering in the K plot is much reduced.
+
+**Cons**
+
+* It discarded about half the records, including ones that were perfectly good.
+* It flattens the response. Records are thinned hardest wherever they are dense, and that includes the species' real hotspots, not just the towns. So most of the other slopes shrink toward 0, and isothermality's moves away from the truth.
+* Applied to the *unbiased* records, where there was nothing to fix, it made things worse: most slopes shrink toward 0 there too.
+* The thinned records are no longer a Poisson process. No two are closer than 100 km, so $L(r) - r$ plunges below the envelope at short distances. That is regularity created by the thinning, not by the species, and it violates the PPM's assumptions in the opposite direction.
+* The intercept no longer means anything: the number of records left depends on the thinning distance, not on the species.
+* The thinning distance is arbitrary, and the results depend on it.
+
+## Comparing the remedies
+
+```{r}
+cbind(truth = round(trueCoefs, 3),
+      coefTable(unbiased = fitPPM, ignoringBias = fitIgnoring, biasCovariate = fitBias,
+                areaInteraction = fitAI, thinned = fitThinBiased))[-1, ]   # slopes only
+```
+
+When the source of the bias can be measured, putting it in the model and predicting at a common level of effort works best. It uses all the records and recovers the species' response. Modeling the dependence and thinning both reduce the bias in the slope that effort was confounded with (MTWQ), but neither removes it. Both also flatten the rest of the response, because neither can tell a cluster of observers from a cluster of the species. The K test is useful either way: it tells us *that* a Poisson model is missing something, even though it can't tell us what.
+
+::: {.callout-tip title="Questions"}
+* The towns were placed preferentially in warm wettest quarters. What would happen to the PPM that ignores the bias if the towns were placed at random instead (`prob = NULL` in `sample()`)? Would the K test still detect clustering?
+* Why does thinning the *unbiased* records flatten the fitted response? Think about which records spThin removes first.
+* The area-interaction model treats clustering as if records attracted each other. When would that be biologically reasonable for the *species* rather than the observers?
+* In a real analysis, the bias covariate is never exactly $-\ln p(s)$. What might go wrong if it is only a rough proxy for effort, such as distance to the nearest road?
+:::
+
+::: {.callout-important title="Exercise"}
+Rerun the thinning with `km = 25` and `km = 250`. How do the number of records kept, the slopes, and the K plot change? Is there a distance that removes the clustering around towns without creating regularity, and without flattening the response?
+:::
+
 # References
+
+Aiello-Lammens, M. E., Boria, R. A., Radosavljevic, A., Vilela, B., & Anderson, R. P. (2015). spThin: An R package for spatial thinning of species occurrence records for use in ecological niche models. *Ecography*, 38(5), 541–545. <https://doi.org/10.1111/ecog.01132>
+
+Baddeley, A., Diggle, P. J., Hardegen, A., Lawrence, T., Milne, R. K., & Nair, G. (2014). On tests of spatial pattern based on simulation envelopes. *Ecological Monographs*, 84(3), 477–489. <https://doi.org/10.1890/13-2042.1>
+
+Baddeley, A. J., Møller, J., & Waagepetersen, R. (2000). Non- and semi-parametric estimation of interaction in inhomogeneous point patterns. *Statistica Neerlandica*, 54(3), 329–350. <https://doi.org/10.1111/1467-9574.00144>
+
+Baddeley, A., & Turner, R. (2000). Practical maximum pseudolikelihood for spatial point patterns. *Australian & New Zealand Journal of Statistics*, 42(3), 283–322. <https://doi.org/10.1111/1467-842X.00128>
 
 Baddeley, A., & Turner, R. (2005). spatstat: An R package for analyzing spatial point patterns. *Journal of Statistical Software*, 12(6), 1–42. <https://doi.org/10.18637/jss.v012.i06>
 

@@ -3,15 +3,17 @@ title: "Demo: Point Process Models"
 subtitle: "FW 532 · Python version"
 ---
 
-This demo has four parts. First we *simulate* presence points from an inhomogeneous Poisson process
+This demo has five parts. First we *simulate* presence points from an inhomogeneous Poisson process
 (IPP). Then we go the other way, as in an SDM: we *fit* a point process model to one simulated
 pattern, using downweighted Poisson regression. Next we ask how many background (quadrature) points
 are enough. The second and third parts follow the supplementary material of Renner et al. (2015,
-Appendix S1, Section 5), and connect to Figure 1 of Valavi et al. (2022). Finally, we use the same
+Appendix S1, Section 5), and connect to Figure 1 of Valavi et al. (2022). Fourth, we use the same
 trick to fit flexible models (boosted regression trees and Maxent) as point process models, and
-compare them with a linear GLM on a species with strongly nonlinear responses.
+compare them with a linear GLM on a species with strongly nonlinear responses. Finally, we add
+sampling bias: we check a model with Ripley's K function, and compare three remedies (a bias
+covariate, an area-interaction model, and thinning the records).
 
-You Will Need: numpy, pandas, matplotlib, statsmodels, scikit-learn, elapid, rasterio, and the course helper module
+You Will Need: numpy, pandas, matplotlib, scipy, statsmodels, scikit-learn, elapid, rasterio, and the course helper module
 `sdmlab.py` (in the same folder as this notebook). Run the cells in order from top to bottom.
 
 ```{python}
@@ -743,7 +745,468 @@ careful tuning of either model, could reverse their order.
 >   `feature_types`, `n_hinge_features`) as in Labs 5 and 6. To keep the test pattern honest, tune on
 >   a separate *validation* pattern (simulate one!). Does the order change?
 
+# Sampling bias and spatial dependence
+
+So far every individual had the same chance, 1 in `scale_factor`, of becoming a record. Real records
+come from people, and people look much harder in some places than others: near towns, roads, and
+field stations. In point-process terms, records are a *thinned* version of the individuals. If an
+individual at location $s$ becomes a record with probability $p(s)$, independently of the others,
+the records are again a Poisson process, with intensity
+
+$$
+\lambda_{\text{records}}(s) = p(s)\,\lambda(s), \qquad \ln \lambda_{\text{records}}(s) = \ln \lambda(s) + \ln p(s).
+$$
+
+When $p$ is constant, a PPM recovers λ up to a constant, which only shifts the intercept. When
+$p(s)$ varies, the model estimates λ × effort. Because the bias enters the log intensity as an extra
+term, $\ln p(s)$, any environmental covariate that is correlated with effort absorbs part of it.
+Then the slopes are biased, not just the intercept.
+
+This section follows Renner et al. (2015) and its Appendix S1 (Section 3). We simulate biased
+records for species 1, fit a PPM that ignores the bias, and check it with Ripley's K function. Then
+we try three remedies: measuring the bias, modeling the extra spatial dependence, and thinning the
+records as the R package spThin does. (The R version of this demo uses spatstat and spThin for these
+steps. Python has no direct equivalents among our packages, so we write short versions ourselves.)
+
+```{python}
+from scipy.spatial import cKDTree                 # fast nearest-neighbour searches
+from scipy.ndimage import distance_transform_edt   # distance of each cell to the coast
+from sklearn.neighbors import BallTree             # great-circle distances
+```
+
+## Simulating biased records
+
+We place 30 "towns" at random, favoring places with a warm wettest quarter (high MTWQ), and let
+survey effort fall off with the distance $d$ to the nearest town:
+
+$$
+p(s) = \frac{1}{1 + d(s)/(50\ \text{km})} .
+$$
+
+Effort is 1 at a town, 1/2 at 50 km, and about 1/11 at 500 km. We scale the intensity so that about
+1,000 records are expected, as before.
+
+```{python}
+cell_x, cell_y = env_stack.xy(row, col)    # centres of all the cells in the region
+rng = np.random.default_rng(97531)
+town_prob = np.exp(all_cells["mtwq"].to_numpy())             # towns favor high MTWQ
+town_cells = rng.choice(len(all_cells), size=30, replace=False, p=town_prob / town_prob.sum())
+towns = pd.DataFrame({"x": cell_x[town_cells], "y": cell_y[town_cells]})
+
+# great-circle distance (km) from every cell to the nearest town
+tree = BallTree(np.radians(towns[["y", "x"]].to_numpy()), metric="haversine")
+d, _ = tree.query(np.radians(np.column_stack([cell_y, cell_x])), k=1)
+dist_km = np.full(lambda_map.shape, np.nan)
+dist_km[row, col] = 6371.0 * d[:, 0]
+effort_map = 1 / (1 + dist_km / 50)        # relative chance that an individual becomes a record
+
+bias_scale = np.nansum(lambda_map * effort_map) * cell_area / 1000   # about 1,000 records expected
+rng = np.random.default_rng(8642)
+bias_pts = sample_ipp(lambda_map * effort_map / bias_scale, env_stack, rng)   # biased records
+len(bias_pts)
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(12, 3.6), constrained_layout=True)
+sdm.plot_map(effort_map, env_stack, ax=axes[0], title="Survey effort, with towns")
+axes[0].scatter(towns["x"], towns["y"], marker="^", s=12, color="red")
+sdm.plot_map(lambda_map / scale_factor, env_stack, ax=axes[1], title="True intensity, with biased records")
+axes[1].scatter(bias_pts["x"], bias_pts["y"], s=1, color="black");
+```
+
+The records pile up around the towns. Far from any town the species is just as common, but hardly
+anyone looks.
+
+## A PPM that ignores the bias
+
+First, the analysis we would do if we didn't think about effort: the same PPM as before, with only
+the environmental covariates. Below is a DWPR function for this section that also accepts extra
+covariates (we'll need them for the remedies), and a table of every cell's covariates, including the
+bias covariate for Remedy 1. Effort changes over tens of kilometers near the towns, so we use 20,000
+quadrature points.
+
+```{python}
+log_dist_map = np.log1p(dist_km / 50)     # the bias covariate, ln(1 + d/50 km), for Remedy 1
+cov_maps = {"mdr": mdr, "iso": iso, "mtwq": mtwq, "log_dist": log_dist_map}
+
+def covariates_at(pts):
+    """Covariate values (including the bias covariate) at a set of points."""
+    return pd.DataFrame({name: sdm.extract(m, env_stack, pts["x"], pts["y"]) for name, m in cov_maps.items()})
+
+cells_b = pd.DataFrame({"x": cell_x, "y": cell_y, **{name: m[row, col] for name, m in cov_maps.items()}})
+rng = np.random.default_rng(1357)
+quad_b = cells_b.iloc[rng.choice(len(cells_b), size=20000, replace=False)].reset_index(drop=True)
+
+def fit_ppm(pres_df, extra=(), quad_df=None, eps=1e-6):
+    """DWPR fit with the environmental terms plus any `extra` covariates (columns of pres_df)."""
+    quad_df = quad_b if quad_df is None else quad_df
+    cols = ["mdr", "iso", "mtwq", *extra]
+    dat = pd.concat([pres_df[cols].assign(pres=1), quad_df[cols].assign(pres=0)], ignore_index=True)
+    wt = np.where(dat["pres"] == 1, eps, region_area / len(quad_df))
+    z = (dat["pres"] / wt).to_numpy()
+    X = design_matrix(dat)
+    for name in extra:
+        X[name] = dat[name]
+    fit = sm.GLM(z, X, family=sm.families.Poisson(), var_weights=wt).fit()
+    mu = fit.fittedvalues.to_numpy()
+    return {"fit": fit,
+            "log_pl": np.sum(wt * (z * np.log(mu) - mu)),   # log (pseudo)likelihood
+            "lam_pres": mu[:len(pres_df)]}                  # fitted intensity at the presences
+
+def coef_table(**fits):
+    """The environmental coefficients of several fits, next to the truth."""
+    out = pd.DataFrame({"truth": true_coefs})
+    for name, f in fits.items():
+        out[name] = f["fit"].params[true_coefs.index]
+    return out.round(3)
+
+fit_unbiased = fit_ppm(covariates_at(pres_pts))   # the unbiased records from earlier
+fit_ignoring = fit_ppm(covariates_at(bias_pts))
+coef_table(unbiased=fit_unbiased, ignoring_bias=fit_ignoring).assign(SE=fit_ignoring["fit"].bse.round(3))
+```
+
+The MTWQ slope is about twice its true value, and the MDR slope is too large as well. The model has
+learned the towns' preference for a warm wettest quarter as if it were the species'. Nothing in the
+output warns us: the standard errors are small, and the estimates look as plausible as the unbiased
+ones.
+
+## Ripley's K: is there clustering the covariates don't explain?
+
+A Poisson PPM assumes the records are independent once the covariates are taken into account
+(Renner et al. 2015). Ripley's K function checks this. $K(r)$ is the expected number of *other*
+points within distance $r$ of a typical point, divided by the intensity; for a homogeneous Poisson
+process it equals $\pi r^2$. The *inhomogeneous* K function (Baddeley, Møller & Waagepetersen 2000)
+weights each pair of points by $1/(\lambda(s_i)\lambda(s_j))$, using the fitted intensity, so that it
+still equals $\pi r^2$ when the fitted Poisson model is right. It is easiest to read as $L(r) - r$,
+where $L(r) = \sqrt{K(r)/\pi}$:
+
+* $L(r) - r \approx 0$: no more clustering than the covariates explain;
+* $L(r) - r > 0$: extra clustering at distance $r$;
+* $L(r) - r < 0$: points are more evenly spaced (*regular*) than the model predicts.
+
+Points near the coast have part of their neighbourhood in the ocean, where there can't be any
+points. The simplest fix, the *border correction*, only counts pairs around points that are at least
+$r$ from the edge of the region. Distances are in degrees: 1° of latitude is about 111 km.
+
+```{python}
+land = ~np.isnan(lambda_map)
+# distance (degrees) from each cell to the nearest cell outside the region
+edge_dist_map = (distance_transform_edt(np.pad(land, 1))[1:-1, 1:-1] - 0.5) * env_stack.res
+r_grid = np.arange(0.05, 5.0001, 0.05)    # distances (degrees) at which to compute L(r)
+
+def l_inhom(pts, lam, r=r_grid):
+    """Inhomogeneous L function with the border correction (like spatstat's Linhom)."""
+    xy = pts[["x", "y"]].to_numpy()
+    b = sdm.extract(edge_dist_map, env_stack, xy[:, 0], xy[:, 1])     # each point's distance to the edge
+    pairs = cKDTree(xy).query_pairs(r.max(), output_type="ndarray")   # all pairs closer than max(r)
+    i = np.concatenate([pairs[:, 0], pairs[:, 1]])                    # count each pair both ways
+    j = np.concatenate([pairs[:, 1], pairs[:, 0]])
+    dij = np.linalg.norm(xy[i] - xy[j], axis=1)
+    w = 1 / (lam[i] * lam[j])
+    num = np.array([w[(dij <= rk) & (b[i] >= rk)].sum() for rk in r])
+    den = np.array([(1 / lam[b >= rk]).sum() for rk in r])
+    return np.sqrt(num / den / np.pi)
+```
+
+How far from 0 is too far? We simulate 39 patterns from the fitted model, refit the model to each
+one, and compute the same function for each. The grey band, the *envelope*, shows the range of the 39
+simulated curves at each distance. A single test over all distances is the Diggle–Cressie–
+Loosmore–Ford (DCLF) test (Baddeley et al. 2014). It adds up the squared deviation of the observed
+curve from the simulations' average, and compares that total with the same quantity for each
+simulation. With 39 simulations the smallest possible p-value is 1/40 = 0.025. (Renner et al. used
+1,001 simulations.)
+
+```{python}
+def k_test(pts, extra=(), nsim=39, seed=1):
+    """Monte Carlo test of a Poisson PPM with the inhomogeneous L function, plus the DCLF test."""
+    fit = fit_ppm(covariates_at(pts), extra)
+    L_obs = l_inhom(pts, fit["lam_pres"])
+    X = design_matrix(cells_b)                       # the fitted intensity map, for simulating
+    for name in extra:
+        X[name] = cells_b[name]
+    lam_map = np.full(lambda_map.shape, np.nan)
+    lam_map[row, col] = fit["fit"].predict(X)
+    rng = np.random.default_rng(seed)
+    sims = []
+    for k in range(nsim):
+        sim = sample_ipp(lam_map, env_stack, rng)              # simulate from the fitted model
+        f = fit_ppm(covariates_at(sim), extra)                 # refit to the simulated pattern
+        sims.append(l_inhom(sim, f["lam_pres"]))
+    sims = np.array(sims)
+    # DCLF: squared deviation from the mean of the simulations (leave-one-out for each simulation)
+    t_obs = np.sum((L_obs - sims.mean(axis=0))**2)
+    loo_mean = (sims.sum(axis=0) - sims) / (nsim - 1)
+    t_sim = np.sum((sims - loo_mean)**2, axis=1)
+    return {"L": L_obs, "lo": sims.min(axis=0), "hi": sims.max(axis=0), "mean": sims.mean(axis=0),
+            "p": (1 + np.sum(t_sim >= t_obs)) / (nsim + 1)}
+
+def plot_k(ax, k, title):
+    ax.fill_between(r_grid, k["lo"] - r_grid, k["hi"] - r_grid, color="0.8")
+    ax.plot(r_grid, k["mean"] - r_grid, "r--", lw=1)
+    ax.plot(r_grid, k["L"] - r_grid, "k", lw=1.5)
+    ax.set(xlabel="r (degrees)", ylabel="L(r) − r", title=f"{title} (DCLF p = {k['p']:.3f})")
+
+k_unbiased = k_test(pres_pts, seed=1)
+k_ignoring = k_test(bias_pts, seed=2)
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.6), constrained_layout=True)
+plot_k(axes[0], k_unbiased, "Unbiased records")
+plot_k(axes[1], k_ignoring, "Biased records");
+```
+
+The unbiased records stay inside the envelope. The biased records rise far above it from about 1°
+(roughly 100 km) onward. They are much more clustered than the environment explains. The test can't
+say *why*. Extra clustering can come from the species (dispersal, social groups), from an
+environmental variable missing from the model, or from the observers. Here we know it's the
+observers, but in a real analysis that's a judgment call.
+
+## Remedy 1: measure the bias
+
+If we can measure what drives effort, we can put it in the model. Renner et al. (2015) used the
+distances to the nearest main road and urban area. Here the bias covariate is
+$\ln(1 + d/50\ \text{km})$. That is exactly $-\ln p(s)$, so its true coefficient is $-1$. Then,
+following Renner et al., we predict with the bias covariate set to a common level, $d = 0$: the
+intensity of records if everywhere were surveyed as hard as next to a town.
+
+```{python}
+fit_bias = fit_ppm(covariates_at(bias_pts), extra=("log_dist",))
+print(coef_table(ignoring_bias=fit_ignoring, with_bias_covariate=fit_bias))
+print("bias coefficient:", round(fit_bias["fit"].params["log_dist"], 3), "  (true value: -1)")
+```
+
+The environmental slopes are back near the truth, and the bias coefficient is close to $-1$. The K
+test agrees that nothing important is missing now:
+
+```{python}
+k_bias = k_test(bias_pts, extra=("log_dist",), seed=3)
+fig, ax = plt.subplots(figsize=(5.5, 3.6))
+plot_k(ax, k_bias, "Biased records, with the bias covariate");
+```
+
+To compare the maps, we use each model's *environmental* part only, $\exp(\mathbf{x}(s)'\boldsymbol\beta)$.
+That is the same as setting the bias covariate to 0 (that is, $d = 0$). We divide each map by its
+mean, because the intercepts mean different things in different models and only the *relative*
+intensity is comparable:
+
+```{python}
+def env_part_map(fit):
+    """exp(environmental part of the log intensity), as a map."""
+    X = design_matrix(cells_b)
+    m = np.full(lambda_map.shape, np.nan)
+    m[row, col] = np.exp(X.to_numpy() @ fit.params[X.columns].to_numpy())
+    return m
+
+relative = lambda m: m / np.nanmean(m)
+rel_maps = {"Truth": relative(lambda_map),
+            "Ignoring the bias": relative(env_part_map(fit_ignoring["fit"])),
+            "Bias covariate, at d = 0": relative(env_part_map(fit_bias["fit"]))}
+fig, axes = plt.subplots(1, 3, figsize=(15, 3.4), constrained_layout=True)
+for ax, (title, m) in zip(axes, rel_maps.items()):
+    sdm.plot_map(m, env_stack, ax=ax, title=title, vmin=0, vmax=3)
+```
+
+Ignoring the bias exaggerates the intensity across the central and southern United States and
+northern Mexico, where most of the towns are, and understates it in the north. With the bias
+covariate, the map matches the truth closely.
+
+## Remedy 2: model the extra spatial dependence
+
+Often we can't measure effort. Another option is to let the model describe the clustering it can't
+explain. Renner et al. (2015) did this with an *area-interaction* model, a Gibbs point process. Its
+intensity at a location $s$ also depends on the other records nearby:
+
+$$
+\ln \lambda(s \mid \text{records}) = \mathbf{x}(s)'\boldsymbol\beta + \theta\, t(s),
+$$
+
+where $t(s)$ is the fraction of a disc of radius $r$ around $s$ that is also within $r$ of another
+record, i.e., covered by the discs around the other records. $\theta > 0$ means records are more
+likely near other records (clustering), and $\theta < 0$ means they avoid each other (inhibition).
+
+Gibbs models are fitted by *maximum pseudolikelihood*. For this model that means the same weighted
+Poisson regression as DWPR, with $t(s)$ as one more covariate, evaluated at the presences and the
+quadrature points (Baddeley & Turner 2000; Renner et al. 2015). In R, spatstat fits this model with
+`ppm(..., interaction = AreaInter(r))`, as in Appendix S1, Section 3.6.
+
+```{python}
+# t(s): the fraction of the disc of radius r around each location that lies within r of another
+# record. We approximate the disc by 177 evenly spaced points and check each one for a record within r.
+disc = np.array([(a, b) for a in np.linspace(-1, 1, 15) for b in np.linspace(-1, 1, 15) if a*a + b*b <= 1])
+
+def covered_fraction(pts, recs, r, own_record=False):
+    xy, rec_xy = pts[["x", "y"]].to_numpy(), recs[["x", "y"]].to_numpy()
+    disc_pts = (xy[:, None, :] + r * disc[None, :, :]).reshape(-1, 2)   # disc points around every location
+    owner = np.repeat(np.arange(len(xy)), len(disc))                    # which location each belongs to
+    dist, idx = cKDTree(rec_xy).query(disc_pts, k=2)                    # the two nearest records
+    if own_record:   # for a record, ignore the record itself
+        dist = np.where(idx[:, 0] == owner, dist[:, 1], dist[:, 0])
+    else:
+        dist = dist[:, 0]
+    return (dist <= r).reshape(len(xy), len(disc)).mean(axis=1)
+
+def fit_area_inter(r):
+    pres_df = covariates_at(bias_pts).assign(covered=covered_fraction(bias_pts, bias_pts, r, own_record=True))
+    quad_df = quad_b.assign(covered=covered_fraction(quad_b, bias_pts, r))
+    return fit_ppm(pres_df, extra=("covered",), quad_df=quad_df)
+```
+
+The radius $r$ has to be chosen. As in Appendix S1 (spatstat's `profilepl()`), we fit the model for
+several radii and keep the one with the largest pseudolikelihood:
+
+```{python}
+radii = [0.25, 0.5, 1, 1.5, 2]   # degrees
+ai_fits = [fit_area_inter(r) for r in radii]
+log_pl = [f["log_pl"] for f in ai_fits]
+fig, ax = plt.subplots(figsize=(5.5, 3.2))
+ax.plot(radii, log_pl, "o-")
+ax.set(xlabel="Disc radius r (degrees)", ylabel="Log pseudolikelihood")
+plt.show()
+
+fit_ai = ai_fits[int(np.argmax(log_pl))]
+print("best radius:", radii[int(np.argmax(log_pl))], "  theta:", round(fit_ai["fit"].params["covered"], 2))
+coef_table(ignoring_bias=fit_ignoring, area_interaction=fit_ai)
+```
+
+The interaction is clearly positive: the model has found the clustering. The MTWQ slope moves part
+of the way back toward the truth, because some of the clustering around towns is now explained by
+"records near other records" instead of by the climate there. But the other slopes don't simply
+improve. Several shrink toward 0, and isothermality's moves *away* from the truth. The interaction
+term discounts every cluster, whatever its cause, so it also discounts the species' real hotspots.
+And the model doesn't know where the towns are, or that remote areas were barely surveyed. Renner et
+al. (2015) add a caution: because the parameters are not maximum-likelihood estimates, the usual
+standard errors, likelihood-ratio tests, and AIC may not apply.
+
+## Remedy 3: thin the records, as spThin does
+
+The most common fix in practice works on the data rather than the model: *spatial thinning*. The R
+package spThin (Aiello-Lammens et al. 2015) repeatedly removes one of the records that has the most
+neighbors closer than a chosen distance, until no two records are that close. The removals are
+random, so it runs several times and we keep the run that keeps the most records. The function below
+follows the same algorithm. We thin to 100 km, both the biased records and, for comparison, the
+unbiased ones:
+
+```{python}
+def thin_records(pts, km, reps=10, seed=1):
+    """Spatial thinning with the spThin algorithm: no two records closer than `km`."""
+    lat, lon = np.radians(pts["y"].to_numpy()), np.radians(pts["x"].to_numpy())
+    # great-circle distances (km) between all pairs of records
+    a = (np.sin((lat[:, None] - lat[None, :]) / 2)**2
+         + np.cos(lat[:, None]) * np.cos(lat[None, :]) * np.sin((lon[:, None] - lon[None, :]) / 2)**2)
+    too_close = 2 * 6371.0 * np.arcsin(np.sqrt(a)) < km
+    np.fill_diagonal(too_close, False)
+    rng = np.random.default_rng(seed)
+    best = None
+    for rep in range(reps):
+        keep = np.ones(len(pts), dtype=bool)
+        n_close = too_close.sum(axis=1).astype(float)    # number of too-close neighbors of each record
+        while n_close.max() > 0:
+            i = rng.choice(np.flatnonzero(n_close == n_close.max()))   # one with the most neighbors
+            keep[i] = False
+            n_close -= too_close[:, i]                   # its neighbors each lose one neighbor
+            n_close[i] = -np.inf                         # never pick it again
+        if best is None or keep.sum() > best.sum():
+            best = keep
+    return pts[best].reset_index(drop=True)
+
+thin_biased = thin_records(bias_pts, km=100)
+thin_unbiased = thin_records(pres_pts, km=100)
+print("biased:  ", len(bias_pts), "->", len(thin_biased))
+print("unbiased:", len(pres_pts), "->", len(thin_unbiased))
+```
+
+```{python}
+ax = sdm.plot_map(effort_map, env_stack, title="Biased records: kept (blue) and removed (red) by thinning to 100 km")
+ax.scatter(bias_pts["x"], bias_pts["y"], s=1.5, color="red")
+ax.scatter(thin_biased["x"], thin_biased["y"], s=2, color="blue");
+```
+
+Now fit the same PPM to the thinned records, and run the K test:
+
+```{python}
+fit_thin_biased = fit_ppm(covariates_at(thin_biased))
+fit_thin_unbiased = fit_ppm(covariates_at(thin_unbiased))
+coef_table(unbiased=fit_unbiased, thinned_unbiased=fit_thin_unbiased,
+           ignoring_bias=fit_ignoring, thinned_biased=fit_thin_biased)
+```
+
+```{python}
+k_thin_biased = k_test(thin_biased, seed=4)
+k_thin_unbiased = k_test(thin_unbiased, seed=5)
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.6), constrained_layout=True)
+plot_k(axes[0], k_thin_unbiased, "Unbiased, thinned")
+plot_k(axes[1], k_thin_biased, "Biased, thinned");
+```
+
+Thinning has real benefits and real costs.
+
+**Pros**
+
+* It needs no information about effort, just the records.
+* It removed many of the records that crowd around towns, so the MTWQ slope moved toward the truth,
+  though not all the way.
+* The large-scale clustering in the K plot is much reduced.
+
+**Cons**
+
+* It discarded about half the records, including ones that were perfectly good.
+* It flattens the response. Records are thinned hardest wherever they are dense, and that includes
+  the species' real hotspots, not just the towns. So most of the other slopes shrink toward 0, and
+  isothermality's moves away from the truth.
+* Applied to the *unbiased* records, where there was nothing to fix, it made things worse: most
+  slopes shrink toward 0 there too.
+* The thinned records are no longer a Poisson process. No two are closer than 100 km, so
+  $L(r) - r$ plunges below the envelope at short distances. That is regularity created by the
+  thinning, not by the species, and it violates the PPM's assumptions in the opposite direction.
+* The intercept no longer means anything: the number of records left depends on the thinning
+  distance, not on the species.
+* The thinning distance is arbitrary, and the results depend on it.
+
+## Comparing the remedies
+
+```{python}
+coef_table(unbiased=fit_unbiased, ignoring_bias=fit_ignoring, bias_covariate=fit_bias,
+           area_interaction=fit_ai, thinned=fit_thin_biased).drop(index="const")   # slopes only
+```
+
+When the source of the bias can be measured, putting it in the model and predicting at a common
+level of effort works best. It uses all the records and recovers the species' response. Modeling
+the dependence and thinning both reduce the bias in the slope that effort was confounded with
+(MTWQ), but neither removes it. Both also flatten the rest of the response, because neither can tell
+a cluster of observers from a cluster of the species. The K test is useful either way: it tells us
+*that* a Poisson model is missing something, even though it can't tell us what.
+
+> **Questions**
+>
+> * The towns were placed preferentially in warm wettest quarters. What would happen to the PPM that
+>   ignores the bias if the towns were placed at random instead (drop `p=` in `rng.choice()`)? Would
+>   the K test still detect clustering?
+> * Why does thinning the *unbiased* records flatten the fitted response? Think about which records
+>   the algorithm removes first.
+> * The area-interaction model treats clustering as if records attracted each other. When would that
+>   be biologically reasonable for the *species* rather than the observers?
+> * In a real analysis, the bias covariate is never exactly $-\ln p(s)$. What might go wrong if it is
+>   only a rough proxy for effort, such as distance to the nearest road?
+
+> **Exercise.** Rerun the thinning with `km=25` and `km=250`. How do the number of records kept, the
+> slopes, and the K plot change? Is there a distance that removes the clustering around towns without
+> creating regularity, and without flattening the response?
+
 # References
+
+Aiello-Lammens, M. E., Boria, R. A., Radosavljevic, A., Vilela, B., & Anderson, R. P. (2015). spThin:
+An R package for spatial thinning of species occurrence records for use in ecological niche models.
+*Ecography*, 38(5), 541–545. <https://doi.org/10.1111/ecog.01132>
+
+Baddeley, A., Diggle, P. J., Hardegen, A., Lawrence, T., Milne, R. K., & Nair, G. (2014). On tests of
+spatial pattern based on simulation envelopes. *Ecological Monographs*, 84(3), 477–489.
+<https://doi.org/10.1890/13-2042.1>
+
+Baddeley, A. J., Møller, J., & Waagepetersen, R. (2000). Non- and semi-parametric estimation of
+interaction in inhomogeneous point patterns. *Statistica Neerlandica*, 54(3), 329–350.
+<https://doi.org/10.1111/1467-9574.00144>
+
+Baddeley, A., & Turner, R. (2000). Practical maximum pseudolikelihood for spatial point patterns.
+*Australian & New Zealand Journal of Statistics*, 42(3), 283–322.
+<https://doi.org/10.1111/1467-842X.00128>
 
 Berman, M., & Turner, T. R. (1992). Approximating point process likelihoods with GLIM. *Journal of
 the Royal Statistical Society, Series C (Applied Statistics)*, 41(1), 31–38.

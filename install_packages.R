@@ -31,7 +31,7 @@ packages <- c(
   # Lab 6: Maxent
   "maxnet",
   # Lab 7 (bonus) and demos
-  "neuralnet", "plotly", "lattice", "spatstat", "ape"
+  "neuralnet", "plotly", "lattice", "spatstat", "spThin", "ape"
 )
 
 missing <- setdiff(packages, rownames(installed.packages()))
